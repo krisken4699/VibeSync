@@ -1,352 +1,588 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Music, LogIn, LogOut, Info, User, Trash2, PlusCircle, Check, Wand2, Search, Sparkles, ChevronLeft, Shuffle } from 'lucide-react';
 
-import React, { useState, useEffect } from 'react';
-import { Music, Frown, Smile, Sparkles, LogIn, Search, Play, PlusCircle, Check, Wand2 } from 'lucide-react';
+const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 
-const SPOTIFY_CLIENT_ID = '0aaa304400ff420cb9a6baef5b234231'; // Replace with your Spotify Client ID
-const REDIRECT_URI = 'https://vibesync-two.vercel.app/'; // Standard Vite local port
+const isDev = window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1" ||
+  window.location.hostname.includes("ngrok-free");
+
+const getRedirectUri = () => {
+  const base = isDev ? window.location.origin : import.meta.env.VITE_REDIRECT_URI_PROD;
+  return base ? base.replace(/\/$/, '') : '';
+};
+
+const REDIRECT_URI = getRedirectUri();
 const AUTH_ENDPOINT = "https://accounts.spotify.com/authorize";
-const RESPONSE_TYPE = "token";
-const SCOPES = "playlist-modify-public playlist-modify-private user-read-private";
+const TOKEN_ENDPOINT = "https://accounts.spotify.com/api/token";
+const SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email user-top-read";
 
-const apiKey = "AIzaSyD_3DKnzMt8306i-5NX1ctDfT6IIILLPNM"; // Replace with your Gemini API Key
+// ─── Mood config ──────────────────────────────────────────
+// Each mood has listener archetypes — each with a catchy label, emoji, description,
+// and a function that builds a search query given the user's taste context.
+const MOODS = [
+  { id: 'sad', emoji: '😔', label: 'Sad' },
+  { id: 'happy', emoji: '😁', label: 'Happy' },
+  { id: 'angry', emoji: '😤', label: 'Angry' },
+  { id: 'anxious', emoji: '😰', label: 'Anxious' },
+  { id: 'bored', emoji: '😑', label: 'Bored' },
+  { id: 'custom', emoji: '✏️', label: 'Describe it' },
+];
+
+const ARCHETYPES = {
+  sad: [
+    { id: 'wallow', label: 'I Loved Her', emoji: '💔', desc: 'Sink into it. Sad songs for sad days.', searchHint: 'heartbreak melancholy sad ballad emotional' },
+    { id: 'cheer', label: 'Cheer Me Up', emoji: '☀️', desc: 'Pull me out of it. Uplifting and warm.', searchHint: 'uplifting feel-good happy energetic pop' },
+    { id: 'rage', label: 'She Was Awful', emoji: '🔥', desc: 'Channel it into something fierce.', searchHint: 'angry empowerment fierce punk rock breakup anthem' },
+    { id: 'surprise', label: 'Surprise Me', emoji: '🎲', desc: 'I have no idea what I need. Pick for me.', searchHint: 'unexpected eclectic genre-blending unique discovery' },
+  ],
+  happy: [
+    { id: 'ride', label: 'Keep It Going', emoji: '🚀', desc: 'Match the energy. Let\'s go higher.', searchHint: 'euphoric energetic dance pop feel-good banger' },
+    { id: 'contrast', label: 'Calm Me Down', emoji: '🌊', desc: 'Balance it out. Chill and smooth.', searchHint: 'chill lofi ambient mellow smooth downtempo' },
+    { id: 'chaos', label: 'I\'m Unhinged', emoji: '⚡', desc: 'Turn it into something chaotic and loud.', searchHint: 'aggressive metal punk hardcore noise experimental' },
+    { id: 'surprise', label: 'Surprise Me', emoji: '🎲', desc: 'Just vibe me something unexpected.', searchHint: 'unexpected genre-blending eclectic discovery' },
+  ],
+  angry: [
+    { id: 'fuel', label: 'Feed the Fire', emoji: '💢', desc: 'More rage. Louder. Harder.', searchHint: 'metal hardcore punk aggressive heavy brutal' },
+    { id: 'detox', label: 'Cool It Down', emoji: '🧊', desc: 'Something to slowly bring me back.', searchHint: 'calming ambient peaceful meditative slow' },
+    { id: 'groove', label: 'Angry but Groovy', emoji: '😤', desc: 'Angry energy but with a rhythm.', searchHint: 'hip hop aggressive trap dark funk groove' },
+    { id: 'surprise', label: 'Surprise Me', emoji: '🎲', desc: 'Anger is just energy. Channel it anywhere.', searchHint: 'unexpected genre-blending unique' },
+  ],
+  anxious: [
+    { id: 'ground', label: 'Ground Me', emoji: '🌿', desc: 'Slow my brain down. Calm and steady.', searchHint: 'ambient calm lofi peaceful meditative acoustic' },
+    { id: 'mask', label: 'Drown It Out', emoji: '🎧', desc: 'Something loud enough to stop the thoughts.', searchHint: 'loud energetic intense wall of sound focus' },
+    { id: 'relate', label: 'You Get It', emoji: '🫂', desc: 'Songs that understand the spiral.', searchHint: 'anxiety overthinking introspective indie emotional' },
+    { id: 'surprise', label: 'Distract Me', emoji: '🎲', desc: 'Literally anything. Just get me out of my head.', searchHint: 'fun quirky upbeat distraction playful' },
+  ],
+  bored: [
+    { id: 'discover', label: 'Find Me Something New', emoji: '🔭', desc: 'I want to hear something I\'ve never heard.', searchHint: 'underground obscure niche emerging artist discovery' },
+    { id: 'nostalgia', label: 'Take Me Back', emoji: '📼', desc: 'Old favorites. Nostalgic hits.', searchHint: 'nostalgic classic throwback 90s 00s retro' },
+    { id: 'intensity', label: 'Wake Me Up', emoji: '⚡', desc: 'Something intense to jolt me out of this.', searchHint: 'high energy intense fast-paced adrenaline' },
+    { id: 'surprise', label: 'Surprise Me', emoji: '🎲', desc: 'Randomize it completely.', searchHint: 'eclectic random genre-blending unexpected' },
+  ],
+};
+
+// ─── Auth helpers ─────────────────────────────────────────
+const generateRandomString = (length) => {
+  const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const values = crypto.getRandomValues(new Uint8Array(length));
+  return values.reduce((acc, x) => acc + possible[x % possible.length], "");
+};
+const sha256 = async (plain) => window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(plain));
+const base64encode = (input) => btoa(String.fromCharCode(...new Uint8Array(input))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 
 const fetchWithRetry = async (url, options, retries = 5) => {
   const delays = [1000, 2000, 4000, 8000, 16000];
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, options);
-      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return res;
-    } catch (error) {
-      if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, delays[i]));
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(r => setTimeout(r, delays[i]));
     }
   }
 };
 
 export default function App() {
-  const [token, setToken] = useState("");
-  const [isConnected, setIsConnected] = useState(false);
-  const [selectedMood, setSelectedMood] = useState(null);
-  const [recommendations, setRecommendations] = useState([]);
-  const [isSearching, setIsSearching] = useState(false);
-  const [saveStatus, setSaveStatus] = useState("");
+  const [token, setToken] = useState(localStorage.getItem("token") || "");
+  const [isConnected, setIsConnected] = useState(!!localStorage.getItem("token"));
+  const [userProfile, setUserProfile] = useState(null);
+  const [userTopData, setUserTopData] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
 
-  const [customVibe, setCustomVibe] = useState("");
-  const [isGeminiThinking, setIsGeminiThinking] = useState(false);
-  const [geminiError, setGeminiError] = useState("");
-  const [playlistMeta, setPlaylistMeta] = useState({ name: "", description: "" });
+  // Flow state: null → mood selected → archetype selected → results
+  const [step, setStep] = useState('mood'); // 'mood' | 'archetype' | 'results' | 'custom'
+  const [selectedMood, setSelectedMood] = useState(null);
+  const [selectedArchetype, setSelectedArchetype] = useState(null);
+  const [customMoodText, setCustomMoodText] = useState('');
+
+  const [tracks, setTracks] = useState([]);
+  const [queue, setQueue] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [playlistMeta, setPlaylistMeta] = useState({ name: '', description: '' });
+  const [saveStatus, setSaveStatus] = useState('');
+  const [geminiError, setGeminiError] = useState('');
+
+  const processedCode = useRef(null);
+
+  // ─── Auth ──────────────────────────────────────────────
+  const fetchUserProfile = async (t) => {
+    if (!t) return;
+    const res = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${t}` } });
+    if (res.ok) setUserProfile(await res.json());
+    else if (res.status === 401) handleLogout();
+  };
+
+  const fetchUserTopData = async (t) => {
+    if (!t) return;
+    try {
+      const [ar, tr] = await Promise.all([
+        fetch('https://api.spotify.com/v1/me/top/artists?limit=5&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
+        fetch('https://api.spotify.com/v1/me/top/tracks?limit=5&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
+      ]);
+      setUserTopData({
+        artists: ar.ok ? (await ar.json()).items : [],
+        tracks: tr.ok ? (await tr.json()).items : [],
+      });
+    } catch (e) { console.error(e); }
+  };
 
   useEffect(() => {
-    const hash = window.location.hash;
-    let localToken = window.localStorage.getItem("token");
+    if (token) { fetchUserProfile(token); fetchUserTopData(token); }
+  }, [token]);
 
-    if (!localToken && hash) {
-      localToken = hash.substring(1).split("&").find(elem => elem.startsWith("access_token")).split("=")[1];
-      window.location.hash = "";
-      window.localStorage.setItem("token", localToken);
-    }
-
-    if (localToken) {
-      setToken(localToken);
-      setIsConnected(true);
-    }
+  useEffect(() => {
+    const run = async () => {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      if (!code || processedCode.current === code) return;
+      processedCode.current = code;
+      window.history.replaceState({}, '', window.location.pathname);
+      const verifier = localStorage.getItem('code_verifier');
+      try {
+        const res = await fetch(TOKEN_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ client_id: SPOTIFY_CLIENT_ID, grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI, code_verifier: verifier }),
+        });
+        const data = await res.json();
+        if (data.access_token) {
+          localStorage.setItem('token', data.access_token);
+          setToken(data.access_token);
+          setIsConnected(true);
+        } else console.error('Token exchange failed:', data);
+      } catch (e) { console.error(e); }
+    };
+    run();
   }, []);
 
-  const handleConnect = () => {
-    window.location.href = `${AUTH_ENDPOINT}?client_id=${SPOTIFY_CLIENT_ID}&redirect_uri=${REDIRECT_URI}&response_type=${RESPONSE_TYPE}&scope=${SCOPES}`;
+  const handleConnect = async () => {
+    const verifier = generateRandomString(64);
+    const challenge = base64encode(await sha256(verifier));
+    localStorage.setItem('code_verifier', verifier);
+    window.location.href = `${AUTH_ENDPOINT}?${new URLSearchParams({
+      response_type: 'code', client_id: SPOTIFY_CLIENT_ID, scope: SCOPES,
+      code_challenge_method: 'S256', code_challenge: challenge, redirect_uri: REDIRECT_URI,
+    })}`;
   };
 
-  const getRecommendations = async (mood) => {
-    setSelectedMood(mood);
-    setIsSearching(true);
-    setRecommendations([]);
-    setSaveStatus("");
-    setPlaylistMeta({ name: `My ${mood} VibeSync`, description: "Generated by VibeSync" });
+  const handleLogout = () => {
+    localStorage.removeItem('token'); localStorage.removeItem('code_verifier');
+    setToken(''); setIsConnected(false); setUserProfile(null); setUserTopData(null);
+    setStep('mood'); setSelectedMood(null); setSelectedArchetype(null); setTracks([]); setQueue([]);
+  };
 
-    if (!token) return;
+  // ─── Music fetching ────────────────────────────────────
+  const tasteContext = userTopData
+    ? `User's top artists: ${userTopData.artists.map(a => a.name).join(', ')}. Genres they like: ${[...new Set(userTopData.artists.flatMap(a => a.genres))].slice(0, 6).join(', ')}.`
+    : '';
 
-    const queries = {
-      sad: 'sad acoustic',
-      happy: 'happy pop',
-      hidden_gems: 'year:2023 tag:new'
-    };
+  const searchTracks = async (query) => {
+    const res = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=10`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (res.status === 401) { handleLogout(); return []; }
+    const data = await res.json();
+    return (data.tracks?.items || []).map(t => ({
+      id: t.id, title: t.name,
+      artist: t.artists.map(a => a.name).join(', '),
+      album: t.album.name, uri: t.uri,
+      image: t.album.images?.[1]?.url || t.album.images?.[0]?.url || '',
+    }));
+  };
+
+  const fetchForArchetype = async (mood, archetype) => {
+    setIsLoading(true);
+    setGeminiError('');
+    setTracks([]);
 
     try {
-      const response = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(queries[mood])}&type=track&limit=10`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const data = await response.json();
+      // Use Gemini to generate a personalized search query based on mood + archetype + taste
+      const modelId = "gemini-2.5-flash-lite";
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+      const prompt = `
+        The user is feeling: "${mood.label}" (${mood.emoji}).
+        They want to listen to music in the style of: "${archetype.label}" — ${archetype.desc}
+        Music hint: ${archetype.searchHint}
+        ${tasteContext}
+        Generate a Spotify search query that perfectly captures this. Make it personalized to their taste if possible.
+        Also generate a short punchy playlist name (max 4 words, like "${archetype.label}" style — catchy, not generic) and a one-sentence description.
+        Output raw JSON only: { "searchQuery": string, "playlistName": string, "playlistDescription": string }
+      `;
 
-      if (data.tracks) {
-        const formattedTracks = data.tracks.items.map(track => ({
-          id: track.id,
-          title: track.name,
-          artist: track.artists.map(a => a.name).join(', '),
-          album: track.album.name,
-          uri: track.uri
-        }));
-        setRecommendations(formattedTracks);
+      const gemRes = await fetchWithRetry(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          systemInstruction: { parts: [{ text: "You are a music curator. Output raw JSON only. No markdown, no explanation." }] },
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      });
+
+      const gemData = await gemRes.json();
+      const text = gemData.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error("Gemini returned nothing");
+
+      const result = JSON.parse(text);
+      setPlaylistMeta({ name: result.playlistName, description: result.playlistDescription });
+
+      const found = await searchTracks(result.searchQuery);
+      setTracks(found);
+    } catch (e) {
+      console.error("Fetch error:", e);
+      // Fallback to direct search if Gemini fails
+      try {
+        const fallback = await searchTracks(`${archetype.searchHint}`);
+        setTracks(fallback);
+        setPlaylistMeta({ name: archetype.label, description: archetype.desc });
+      } catch (e2) {
+        setGeminiError("Something went wrong. Try again.");
       }
-    } catch (error) {
-      console.error("Error fetching tracks:", error);
     } finally {
-      setIsSearching(false);
+      setIsLoading(false);
     }
   };
 
-  const getGeminiRecommendations = async () => {
-    if (!customVibe.trim() || !token) return;
-
-    setSelectedMood('custom');
-    setIsGeminiThinking(true);
-    setIsSearching(true);
-    setRecommendations([]);
-    setSaveStatus("");
-    setGeminiError("");
-
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [{ parts: [{ text: `The user wants to listen to music with this vibe: "${customVibe}". Generate a highly optimized Spotify search query to find 10 tracks matching this exact mood. Use Spotify search syntax like genre:, year:, or descriptive keywords. Also generate a catchy, creative playlist name and a short description.` }] }],
-        systemInstruction: { parts: [{ text: "You are an expert music curator and DJ. Respond ONLY with valid JSON." }] },
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: "OBJECT",
-            properties: {
-              searchQuery: { type: "STRING" },
-              playlistName: { type: "STRING" },
-              playlistDescription: { type: "STRING" }
-            },
-            required: ["searchQuery", "playlistName", "playlistDescription"]
-          }
-        }
-      };
-
-      const geminiRes = await fetchWithRetry(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const geminiData = await geminiRes.json();
-      const aiResult = JSON.parse(geminiData.candidates[0].content.parts[0].text);
-
-      setPlaylistMeta({ name: aiResult.playlistName, description: aiResult.playlistDescription });
-      setIsGeminiThinking(false);
-
-      const spotifyRes = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(aiResult.searchQuery)}&type=track&limit=10`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const spotifyData = await spotifyRes.json();
-
-      if (spotifyData.tracks) {
-        const formattedTracks = spotifyData.tracks.items.map(track => ({
-          id: track.id,
-          title: track.name,
-          artist: track.artists.map(a => a.name).join(', '),
-          album: track.album.name,
-          uri: track.uri
-        }));
-        setRecommendations(formattedTracks);
-      }
-    } catch (error) {
-      console.error("Error with Gemini or Spotify:", error);
-      setGeminiError("Failed to interpret your vibe. Try again.");
-    } finally {
-      setIsSearching(false);
-      setIsGeminiThinking(false);
+  const handleMoodSelect = (mood) => {
+    if (mood.id === 'custom') {
+      setSelectedMood(mood);
+      setStep('custom');
+    } else {
+      setSelectedMood(mood);
+      setStep('archetype');
     }
   };
+
+  const handleArchetypeSelect = (archetype) => {
+    setSelectedArchetype(archetype);
+    setStep('results');
+    fetchForArchetype(selectedMood, archetype);
+  };
+
+  const handleCustomSubmit = async () => {
+    if (!customMoodText.trim()) return;
+    setIsLoading(true);
+    setGeminiError('');
+    setTracks([]);
+    setStep('results');
+
+    try {
+      const modelId = "gemini-2.5-flash-lite";
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+      const prompt = `
+        The user describes their current mood/vibe as: "${customMoodText}"
+        ${tasteContext}
+        Generate a Spotify search query for music that fits this perfectly. Personalize it to their taste.
+        Generate a short punchy playlist name (max 4 words, catchy) and a one-sentence description.
+        Output raw JSON only: { "searchQuery": string, "playlistName": string, "playlistDescription": string }
+      `;
+
+      const gemRes = await fetchWithRetry(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          systemInstruction: { parts: [{ text: "Music curator. Output raw JSON only." }] },
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      });
+
+      const gemData = await gemRes.json();
+      const text = gemData.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error("No response");
+
+      const result = JSON.parse(text);
+      setPlaylistMeta({ name: result.playlistName, description: result.playlistDescription });
+      const found = await searchTracks(result.searchQuery);
+      setTracks(found);
+    } catch (e) {
+      setGeminiError("Couldn't decode that vibe. Try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const addToQueue = (track) => {
+    if (queue.find(t => t.id === track.id)) return;
+    setQueue(prev => [...prev, track]);
+  };
+  const removeFromQueue = (id) => setQueue(prev => prev.filter(t => t.id !== id));
 
   const savePlaylist = async () => {
-    if (!token || recommendations.length === 0) return;
-    setSaveStatus("saving");
+    const toSave = queue.length > 0 ? queue : tracks;
+    if (!token || toSave.length === 0 || !userProfile?.id) return;
+    setSaveStatus('saving');
     try {
-      const userRes = await fetch('https://api.spotify.com/v1/me', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const userData = await userRes.json();
-
-      const playlistRes = await fetch(`https://api.spotify.com/v1/users/${userData.id}/playlists`, {
+      const plRes = await fetch('https://api.spotify.com/v1/me/playlists', {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: playlistMeta.name, description: playlistMeta.description })
+        body: JSON.stringify({ name: playlistMeta.name || 'VibeSync', description: playlistMeta.description || '', public: false }),
       });
-      const playlistData = await playlistRes.json();
-
-      const trackUris = recommendations.map(t => t.uri);
-      await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
+      if (!plRes.ok) { setSaveStatus('error'); return; }
+      const pl = await plRes.json();
+      const addRes = await fetch(`https://api.spotify.com/v1/playlists/${pl.id}/items`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uris: trackUris })
+        body: JSON.stringify({ uris: toSave.map(t => t.uri) }),
       });
-
-      setSaveStatus("saved");
-    } catch (error) {
-      console.error("Error saving playlist:", error);
-      setSaveStatus("error");
-    }
+      if (!addRes.ok) { setSaveStatus('error'); return; }
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus(''), 3000);
+    } catch (e) { setSaveStatus('error'); }
   };
 
+  const reset = () => {
+    setStep('mood'); setSelectedMood(null); setSelectedArchetype(null);
+    setTracks([]); setQueue([]); setCustomMoodText(''); setGeminiError(''); setSaveStatus('');
+  };
+
+  // ─── UI ────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-neutral-900 text-white font-sans p-6">
-      <div className="max-w-3xl mx-auto">
+    <div className="min-h-screen bg-neutral-950 text-white font-sans selection:bg-green-500/20">
+      <div className="max-w-2xl mx-auto px-4 py-6">
 
-        <header className="flex items-center justify-between mb-10 pb-6 border-b border-neutral-800">
+        {/* Header */}
+        <header className="flex items-center justify-between mb-10 pb-5 border-b border-neutral-800">
           <div className="flex items-center gap-3">
-            <div className="bg-green-500 p-2 rounded-full text-black">
-              <Music size={24} />
+            <div className="bg-green-500 p-2 rounded-xl text-black">
+              <Music size={20} />
             </div>
-            <h1 className="text-2xl font-bold tracking-tight">VibeSync</h1>
+            <span className="font-black tracking-tighter uppercase italic text-lg">VibeSync</span>
           </div>
-
           {!isConnected ? (
-            <button
-              onClick={handleConnect}
-              className="flex items-center gap-2 bg-green-500 hover:bg-green-400 text-black px-4 py-2 rounded-full font-semibold transition-colors"
-            >
-              <LogIn size={18} />
-              Connect Spotify
-            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setShowDebug(!showDebug)} className="p-2 text-neutral-600 hover:text-white transition-colors"><Info size={18} /></button>
+              <button onClick={handleConnect} className="flex items-center gap-2 bg-green-500 hover:bg-green-400 text-black px-4 py-2 rounded-full font-bold text-sm transition-all active:scale-95">
+                <LogIn size={16} /> Connect Spotify
+              </button>
+            </div>
           ) : (
-            <div className="flex items-center gap-3 bg-neutral-800 px-4 py-2 rounded-full">
-              <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Felix" alt="User" className="w-6 h-6 rounded-full bg-neutral-700" />
-              <span className="text-sm font-medium">Connected</span>
+            <div className="flex items-center gap-3">
+              {userTopData?.artists?.length > 0 && (
+                <div className="hidden sm:flex items-center gap-2 flex-wrap">
+                  {userTopData.artists.slice(0, 3).map(a => (
+                    <span key={a.id} className="flex items-center gap-1 bg-neutral-800 border border-neutral-700 px-2 py-0.5 rounded-full text-[11px] font-bold text-neutral-400">
+                      {a.images?.[2]?.url && <img src={a.images[2].url} className="w-3 h-3 rounded-full" alt="" />}
+                      {a.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-2 bg-neutral-800 p-1 pr-3 rounded-full border border-neutral-700">
+                {userProfile?.images?.[0]?.url
+                  ? <img src={userProfile.images[0].url} className="w-7 h-7 rounded-full object-cover" alt="" />
+                  : <div className="w-7 h-7 rounded-full bg-neutral-700 flex items-center justify-center"><User size={12} /></div>
+                }
+                <span className="text-xs font-bold hidden sm:inline truncate max-w-[100px]">{userProfile?.display_name}</span>
+              </div>
+              <button onClick={handleLogout} className="p-2 text-neutral-600 hover:text-red-400 transition-colors bg-neutral-800 rounded-full border border-neutral-700"><LogOut size={16} /></button>
             </div>
           )}
         </header>
 
+        {showDebug && !isConnected && (
+          <div className="mb-6 p-4 bg-neutral-900 border border-blue-500/20 rounded-2xl text-xs space-y-2">
+            <p className="text-blue-400 font-bold uppercase tracking-widest text-[10px]">Debug</p>
+            <p className="text-neutral-400">Redirect URI:</p>
+            <code className="block p-2 bg-black rounded text-green-400 break-all select-all">{REDIRECT_URI}</code>
+            <p className="text-neutral-400">Client ID: <span className={SPOTIFY_CLIENT_ID ? "text-green-400" : "text-red-400"}>{SPOTIFY_CLIENT_ID ? "Loaded" : "Missing — check .env"}</span></p>
+          </div>
+        )}
+
         {!isConnected ? (
-          <div className="text-center py-20 flex flex-col items-center">
-            <Music size={64} className="text-neutral-600 mb-6" />
-            <h2 className="text-3xl font-bold mb-4">Discover Your Next Obsession</h2>
-            <p className="text-neutral-400 mb-8 max-w-md">
-              Connect your Spotify account to get highly curated track recommendations based on your exact mood or find hidden gems you've never heard before.
-            </p>
+          <div className="text-center py-24 flex flex-col items-center">
+            <Music size={64} className="text-neutral-800 mb-6 animate-pulse" />
+            <h2 className="text-5xl font-black uppercase italic mb-3">VibeSync.</h2>
+            <p className="text-neutral-500 max-w-sm text-base leading-relaxed">Music for the person you are right now — not just how you feel.</p>
           </div>
         ) : (
           <div className="space-y-8">
 
-            <section>
-              <h2 className="text-xl font-bold mb-4">What's the vibe right now?</h2>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <button
-                  onClick={() => getRecommendations('sad')}
-                  className={`flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-all ${selectedMood === 'sad' ? 'border-blue-500 bg-blue-500/10 text-blue-400' : 'border-neutral-800 bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
-                >
-                  <Frown size={32} />
-                  <span className="font-medium">In My Feelings</span>
-                </button>
-
-                <button
-                  onClick={() => getRecommendations('happy')}
-                  className={`flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-all ${selectedMood === 'happy' ? 'border-yellow-500 bg-yellow-500/10 text-yellow-400' : 'border-neutral-800 bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
-                >
-                  <Smile size={32} />
-                  <span className="font-medium">Upbeat & Cheerful</span>
-                </button>
-
-                <button
-                  onClick={() => getRecommendations('hidden_gems')}
-                  className={`flex flex-col items-center justify-center gap-3 p-6 rounded-2xl border-2 transition-all ${selectedMood === 'hidden_gems' ? 'border-purple-500 bg-purple-500/10 text-purple-400' : 'border-neutral-800 bg-neutral-800 hover:bg-neutral-700 text-neutral-300'}`}
-                >
-                  <Sparkles size={32} />
-                  <span className="font-medium">Hidden Gems</span>
-                </button>
-              </div>
-            </section>
-
-            <section className="bg-neutral-800/30 p-6 rounded-2xl border border-neutral-800">
-              <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
-                <Wand2 className="text-purple-500" size={24} />
-                Or describe your exact vibe
-              </h2>
-              <div className="flex flex-col sm:flex-row gap-3">
-                <input
-                  type="text"
-                  value={customVibe}
-                  onChange={(e) => setCustomVibe(e.target.value)}
-                  placeholder="e.g. studying in a rainy Tokyo cafe, 90s grunge anger..."
-                  className="flex-1 bg-neutral-900 border border-neutral-700 rounded-xl px-4 py-3 text-white placeholder-neutral-500 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition-all"
-                  onKeyDown={(e) => e.key === 'Enter' && getGeminiRecommendations()}
-                />
-                <button
-                  onClick={getGeminiRecommendations}
-                  disabled={!customVibe.trim() || isSearching}
-                  className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:hover:bg-purple-600 text-white px-6 py-3 rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
-                >
-                  ✨ Generate Magic Queue
-                </button>
-              </div>
-              {geminiError && <p className="text-red-400 text-sm mt-3">{geminiError}</p>}
-            </section>
-
-            {(isSearching || recommendations.length > 0) && (
-              <section className="bg-neutral-800/50 rounded-2xl p-6 border border-neutral-800">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-                  <div>
-                    <h3 className="text-lg font-semibold flex items-center gap-2">
-                      {isGeminiThinking ? (
-                        <>
-                          <Sparkles className="animate-pulse text-purple-500" size={20} />
-                          Gemini is decoding your vibe...
-                        </>
-                      ) : isSearching ? (
-                        <>
-                          <Search className="animate-pulse text-green-500" size={20} />
-                          Searching Spotify...
-                        </>
-                      ) : (
-                        <>
-                          <Music className="text-green-500" size={20} />
-                          {playlistMeta.name || "Your Custom Queue"}
-                        </>
-                      )}
-                    </h3>
-                    {!isSearching && selectedMood === 'custom' && playlistMeta.description && (
-                      <p className="text-sm text-neutral-400 mt-1">{playlistMeta.description}</p>
-                    )}
-                  </div>
-
-                  {!isSearching && recommendations.length > 0 && (
+            {/* STEP: Mood selection */}
+            {step === 'mood' && (
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <h2 className="text-2xl font-black mb-1">How are you feeling?</h2>
+                <p className="text-neutral-500 text-sm mb-6">Pick your mood and we'll figure out the rest.</p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {MOODS.map(mood => (
                     <button
-                      onClick={savePlaylist}
-                      disabled={saveStatus === "saving" || saveStatus === "saved"}
-                      className="text-sm bg-neutral-700 hover:bg-neutral-600 disabled:opacity-50 px-3 py-1.5 rounded-full transition-colors flex items-center gap-1"
+                      key={mood.id}
+                      onClick={() => handleMoodSelect(mood)}
+                      className="flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-700 transition-all active:scale-95 group"
                     >
-                      {saveStatus === "saving" ? "Saving..." : saveStatus === "saved" ? <><Check size={16} /> Saved</> : "Save as Playlist"}
+                      <span className="text-3xl">{mood.emoji}</span>
+                      <span className="font-bold text-sm text-neutral-300 group-hover:text-white transition-colors">{mood.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* STEP: Custom mood text input */}
+            {step === 'custom' && (
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                  <ChevronLeft size={16} /> Back
+                </button>
+                <h2 className="text-2xl font-black mb-1">Describe it.</h2>
+                <p className="text-neutral-500 text-sm mb-6">What's the vibe? Be as specific or as abstract as you want.</p>
+                <div className="bg-neutral-900 border border-neutral-700 rounded-2xl p-4 focus-within:border-purple-500/50 transition-all">
+                  <textarea
+                    value={customMoodText}
+                    onChange={e => setCustomMoodText(e.target.value)}
+                    placeholder="e.g. 3am driving alone, windows down, thinking about everything and nothing..."
+                    className="w-full bg-transparent text-white placeholder:text-neutral-600 resize-none focus:outline-none text-sm leading-relaxed min-h-[80px]"
+                    onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleCustomSubmit())}
+                  />
+                </div>
+                <button
+                  onClick={handleCustomSubmit}
+                  disabled={!customMoodText.trim()}
+                  className="mt-3 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 text-white py-3.5 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95"
+                >
+                  <Sparkles size={16} /> Find My Music
+                </button>
+              </div>
+            )}
+
+            {/* STEP: Archetype selection */}
+            {step === 'archetype' && selectedMood && (
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                  <ChevronLeft size={16} /> Back
+                </button>
+                <h2 className="text-2xl font-black mb-1">
+                  You're feeling {selectedMood.emoji} {selectedMood.label}.
+                </h2>
+                <p className="text-neutral-500 text-sm mb-6">What kind of listener are you right now?</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {(ARCHETYPES[selectedMood.id] || []).map(archetype => (
+                    <button
+                      key={archetype.id}
+                      onClick={() => handleArchetypeSelect(archetype)}
+                      className="flex items-start gap-4 p-5 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-600 transition-all active:scale-95 text-left group"
+                    >
+                      <span className="text-2xl mt-0.5">{archetype.emoji}</span>
+                      <div>
+                        <p className="font-black text-white text-base leading-tight">{archetype.label}</p>
+                        <p className="text-neutral-500 text-xs mt-1 group-hover:text-neutral-400 transition-colors">{archetype.desc}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* STEP: Results */}
+            {step === 'results' && (
+              <div className="animate-in fade-in duration-300 space-y-6">
+                <div className="flex items-center justify-between">
+                  <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors">
+                    <ChevronLeft size={16} /> Start over
+                  </button>
+                  {!isLoading && tracks.length > 0 && (
+                    <button
+                      onClick={() => { setStep('archetype'); setTracks([]); }}
+                      className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors"
+                    >
+                      <Shuffle size={14} /> Try another vibe
                     </button>
                   )}
                 </div>
 
-                {isSearching ? (
-                  <div className="space-y-3">
-                    {[1, 2, 3].map((i) => (
-                      <div key={i} className="h-16 bg-neutral-800 animate-pulse rounded-xl"></div>
-                    ))}
+                {isLoading ? (
+                  <div className="space-y-4">
+                    <div className="h-8 w-48 bg-neutral-800 animate-pulse rounded-lg" />
+                    <div className="h-4 w-64 bg-neutral-800 animate-pulse rounded" />
+                    {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" />)}
+                  </div>
+                ) : geminiError ? (
+                  <div className="text-center py-12">
+                    <p className="text-neutral-500 mb-4">{geminiError}</p>
+                    <button onClick={() => selectedArchetype && fetchForArchetype(selectedMood, selectedArchetype)} className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all">Try again</button>
                   </div>
                 ) : (
-                  <div className="space-y-2">
-                    {recommendations.map((track) => (
-                      <div key={track.id} className="group flex items-center justify-between p-3 hover:bg-neutral-700/50 rounded-xl transition-colors">
-                        <div className="flex items-center gap-4">
-                          <div className="w-10 h-10 bg-neutral-700 rounded-md flex items-center justify-center group-hover:bg-green-500 transition-colors cursor-pointer">
-                            <Play size={16} className="text-neutral-400 group-hover:text-black ml-1" />
-                          </div>
-                          <div>
-                            <p className="font-medium text-white">{track.title}</p>
-                            <p className="text-sm text-neutral-400">{track.artist} • {track.album}</p>
-                          </div>
+                  <>
+                    <div>
+                      <h2 className="text-3xl font-black leading-tight">{playlistMeta.name}</h2>
+                      <p className="text-neutral-500 text-sm mt-1">{playlistMeta.description}</p>
+                    </div>
+
+                    {/* Queue */}
+                    {queue.length > 0 && (
+                      <div className="bg-green-500/5 border border-green-500/20 rounded-2xl p-4 space-y-2">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs font-black text-green-400 uppercase tracking-widest">My Pick ({queue.length})</span>
+                          <button
+                            onClick={savePlaylist}
+                            disabled={saveStatus === 'saving'}
+                            className={`text-xs px-4 py-1.5 rounded-full font-black uppercase transition-all ${saveStatus === 'saved' ? 'bg-green-500 text-black' : 'bg-green-600 hover:bg-green-500 text-white'}`}
+                          >
+                            {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved!' : 'Save to Spotify'}
+                          </button>
                         </div>
-                        <button className="text-neutral-400 hover:text-white p-2">
-                          <PlusCircle size={20} />
-                        </button>
+                        {queue.map(track => (
+                          <div key={track.id} className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-3 min-w-0">
+                              <img src={track.image} className="w-8 h-8 rounded-lg shrink-0" alt="" />
+                              <div className="min-w-0">
+                                <p className="text-sm font-bold truncate">{track.title}</p>
+                                <p className="text-xs text-neutral-500 truncate">{track.artist}</p>
+                              </div>
+                            </div>
+                            <button onClick={() => removeFromQueue(track.id)} className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"><Trash2 size={15} /></button>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    )}
+
+                    {/* Track list */}
+                    <div className="space-y-1">
+                      {tracks.map((track, i) => (
+                        <div
+                          key={track.id}
+                          className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all"
+                        >
+                          <span className="text-xs text-neutral-700 w-4 text-center shrink-0 group-hover:hidden">{i + 1}</span>
+                          <button
+                            onClick={() => addToQueue(track)}
+                            className={`hidden group-hover:flex items-center justify-center w-4 shrink-0 transition-all ${queue.find(t => t.id === track.id) ? 'text-green-400' : 'text-neutral-400 hover:text-white'}`}
+                          >
+                            {queue.find(t => t.id === track.id) ? <Check size={14} strokeWidth={3} /> : <PlusCircle size={14} />}
+                          </button>
+                          <img src={track.image} className="w-10 h-10 rounded-lg shrink-0 shadow-lg" alt="" />
+                          <div className="flex-1 min-w-0">
+                            <p className="font-bold text-sm truncate text-white">{track.title}</p>
+                            <p className="text-xs text-neutral-500 truncate">{track.artist} · {track.album}</p>
+                          </div>
+                          <button
+                            onClick={() => addToQueue(track)}
+                            className={`shrink-0 p-1.5 rounded-full transition-all ${queue.find(t => t.id === track.id) ? 'text-green-400 bg-green-500/10' : 'text-neutral-600 hover:text-white hover:bg-neutral-700'}`}
+                          >
+                            {queue.find(t => t.id === track.id) ? <Check size={16} strokeWidth={3} /> : <PlusCircle size={16} />}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Save all */}
+                    {tracks.length > 0 && queue.length === 0 && (
+                      <button
+                        onClick={savePlaylist}
+                        disabled={saveStatus === 'saving'}
+                        className={`w-full py-3 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95 ${saveStatus === 'saved' ? 'bg-green-500 text-black' : 'bg-neutral-800 border border-neutral-700 hover:bg-neutral-700 text-white'}`}
+                      >
+                        {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved to Spotify!' : 'Save All to Spotify'}
+                      </button>
+                    )}
+                  </>
                 )}
-              </section>
+              </div>
             )}
 
           </div>
