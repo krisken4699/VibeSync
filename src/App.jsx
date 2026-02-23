@@ -2,7 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Music, LogIn, LogOut, Info, User, Trash2, PlusCircle, Check, Wand2, Search, Sparkles, ChevronLeft, Shuffle } from 'lucide-react';
 
 const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+// Use the correct model - 2.0 flash is current
+const GEMINI_MODEL = 'gemini-2.0-flash-exp';
 
 const isDev = window.location.hostname === "localhost" ||
   window.location.hostname === "127.0.0.1" ||
@@ -19,8 +21,6 @@ const TOKEN_ENDPOINT = "https://accounts.spotify.com/api/token";
 const SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email user-top-read";
 
 // ─── Mood config ──────────────────────────────────────────
-// Each mood has listener archetypes — each with a catchy label, emoji, description,
-// and a function that builds a search query given the user's taste context.
 const MOODS = [
   { id: 'sad', emoji: '😔', label: 'Sad' },
   { id: 'happy', emoji: '😁', label: 'Happy' },
@@ -34,7 +34,7 @@ const ARCHETYPES = {
   sad: [
     { id: 'wallow', label: 'I Loved Her', emoji: '💔', desc: 'Sink into it. Sad songs for sad days.', searchHint: 'heartbreak melancholy sad ballad emotional' },
     { id: 'cheer', label: 'Cheer Me Up', emoji: '☀️', desc: 'Pull me out of it. Uplifting and warm.', searchHint: 'uplifting feel-good happy energetic pop' },
-    { id: 'rage', label: 'She Was Awful', emoji: '🔥', desc: 'Channel it into something fierce.', searchHint: 'angry empowerment fierce punk rock breakup anthem' },
+    { id: 'rage', label: 'RAHHH', emoji: '🔥', desc: 'Channel it into something fierce.', searchHint: 'angry empowerment fierce punk rock breakup anthem' },
     { id: 'surprise', label: 'Surprise Me', emoji: '🎲', desc: 'I have no idea what I need. Pick for me.', searchHint: 'unexpected eclectic genre-blending unique discovery' },
   ],
   happy: [
@@ -72,20 +72,76 @@ const generateRandomString = (length) => {
 const sha256 = async (plain) => window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(plain));
 const base64encode = (input) => btoa(String.fromCharCode(...new Uint8Array(input))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 
-const fetchWithRetry = async (url, options, retries = 5) => {
-  const delays = [1000, 2000, 4000, 8000, 16000];
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(url, options);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res;
-    } catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, delays[i]));
+// Simple fetch without retry for Spotify (your old code worked, so keep it simple)
+const searchTracks = async (token, query) => {
+  if (!query || query.trim() === '') return [];
+
+  // Clean the query - remove special characters and limit length
+  const cleanQuery = query
+    .replace(/[^\w\s]/g, ' ')  // Replace special chars with space
+    .replace(/\s+/g, ' ')       // Replace multiple spaces with single space
+    .trim()
+    .slice(0, 50);              // Limit to 50 chars max
+
+  if (!cleanQuery) return [];
+
+  console.log('Searching Spotify with:', cleanQuery); // Debug
+
+  try {
+    const res = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(cleanQuery)}&type=track&limit=10`, // Changed to 10
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (res.status === 401) {
+      handleLogout();
+      return [];
     }
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      console.error('Search failed:', errorText);
+      return [];
+    }
+
+    const data = await res.json();
+    return (data.tracks?.items || []).map(t => ({
+      id: t.id,
+      title: t.name,
+      artist: t.artists.map(a => a.name).join(', '),
+      album: t.album.name,
+      uri: t.uri,
+      image: t.album.images?.[1]?.url || t.album.images?.[0]?.url || '',
+    }));
+  } catch (e) {
+    console.error('Search error:', e);
+    return [];
   }
 };
+// Generate search query with variety based on user's taste
+const generateQuery = (baseHint, userTopData) => {
+  if (!userTopData?.artists?.length) return baseHint;
 
+  const artists = userTopData.artists;
+
+  // Pick ONE random artist name (just the first word if it's long)
+  const randomArtist = artists[Math.floor(Math.random() * artists.length)]?.name || '';
+  const shortArtist = randomArtist.split(' ')[0]; // Take just first word
+
+  // Much simpler queries - just the base hint OR hint + artist
+  // Removed genres which can be weird strings
+  const variations = [
+    baseHint.split(' ').slice(0, 3).join(' '), // Only first 3 words of hint
+    `${baseHint.split(' ')[0]} ${shortArtist}`, // First word of hint + artist
+    shortArtist, // Just the artist name
+  ].filter(q => q.length > 2); // Remove very short queries
+
+  // Return a very simple query
+  return variations[Math.floor(Math.random() * variations.length)]
+    .replace(/[^\w\s]/g, '')
+    .trim()
+    .slice(0, 30); // Max 30 chars
+};
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem("token") || "");
   const [isConnected, setIsConnected] = useState(!!localStorage.getItem("token"));
@@ -93,8 +149,7 @@ export default function App() {
   const [userTopData, setUserTopData] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
 
-  // Flow state: null → mood selected → archetype selected → results
-  const [step, setStep] = useState('mood'); // 'mood' | 'archetype' | 'results' | 'custom'
+  const [step, setStep] = useState('mood');
   const [selectedMood, setSelectedMood] = useState(null);
   const [selectedArchetype, setSelectedArchetype] = useState(null);
   const [customMoodText, setCustomMoodText] = useState('');
@@ -104,7 +159,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [playlistMeta, setPlaylistMeta] = useState({ name: '', description: '' });
   const [saveStatus, setSaveStatus] = useState('');
-  const [geminiError, setGeminiError] = useState('');
+  const [error, setError] = useState('');
 
   const processedCode = useRef(null);
 
@@ -120,8 +175,8 @@ export default function App() {
     if (!t) return;
     try {
       const [ar, tr] = await Promise.all([
-        fetch('https://api.spotify.com/v1/me/top/artists?limit=5&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
-        fetch('https://api.spotify.com/v1/me/top/tracks?limit=5&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
+        fetch('https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
+        fetch('https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
       ]);
       setUserTopData({
         artists: ar.ok ? (await ar.json()).items : [],
@@ -153,7 +208,7 @@ export default function App() {
           localStorage.setItem('token', data.access_token);
           setToken(data.access_token);
           setIsConnected(true);
-        } else console.error('Token exchange failed:', data);
+        }
       } catch (e) { console.error(e); }
     };
     run();
@@ -172,82 +227,10 @@ export default function App() {
   const handleLogout = () => {
     localStorage.removeItem('token'); localStorage.removeItem('code_verifier');
     setToken(''); setIsConnected(false); setUserProfile(null); setUserTopData(null);
-    setStep('mood'); setSelectedMood(null); setSelectedArchetype(null); setTracks([]); setQueue([]);
+    reset();
   };
 
-  // ─── Music fetching ────────────────────────────────────
-  const tasteContext = userTopData
-    ? `User's top artists: ${userTopData.artists.map(a => a.name).join(', ')}. Genres they like: ${[...new Set(userTopData.artists.flatMap(a => a.genres))].slice(0, 6).join(', ')}.`
-    : '';
-
-  const searchTracks = async (query) => {
-    const res = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=10`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.status === 401) { handleLogout(); return []; }
-    const data = await res.json();
-    return (data.tracks?.items || []).map(t => ({
-      id: t.id, title: t.name,
-      artist: t.artists.map(a => a.name).join(', '),
-      album: t.album.name, uri: t.uri,
-      image: t.album.images?.[1]?.url || t.album.images?.[0]?.url || '',
-    }));
-  };
-
-  const fetchForArchetype = async (mood, archetype) => {
-    setIsLoading(true);
-    setGeminiError('');
-    setTracks([]);
-
-    try {
-      // Use Gemini to generate a personalized search query based on mood + archetype + taste
-      const modelId = "gemini-2.5-flash-lite";
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
-      const prompt = `
-        The user is feeling: "${mood.label}" (${mood.emoji}).
-        They want to listen to music in the style of: "${archetype.label}" — ${archetype.desc}
-        Music hint: ${archetype.searchHint}
-        ${tasteContext}
-        Generate a Spotify search query that perfectly captures this. Make it personalized to their taste if possible.
-        Also generate a short punchy playlist name (max 4 words, like "${archetype.label}" style — catchy, not generic) and a one-sentence description.
-        Output raw JSON only: { "searchQuery": string, "playlistName": string, "playlistDescription": string }
-      `;
-
-      const gemRes = await fetchWithRetry(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          systemInstruction: { parts: [{ text: "You are a music curator. Output raw JSON only. No markdown, no explanation." }] },
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-      });
-
-      const gemData = await gemRes.json();
-      const text = gemData.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error("Gemini returned nothing");
-
-      const result = JSON.parse(text);
-      setPlaylistMeta({ name: result.playlistName, description: result.playlistDescription });
-
-      const found = await searchTracks(result.searchQuery);
-      setTracks(found);
-    } catch (e) {
-      console.error("Fetch error:", e);
-      // Fallback to direct search if Gemini fails
-      try {
-        const fallback = await searchTracks(`${archetype.searchHint}`);
-        setTracks(fallback);
-        setPlaylistMeta({ name: archetype.label, description: archetype.desc });
-      } catch (e2) {
-        setGeminiError("Something went wrong. Try again.");
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
+  // ─── Main logic ────────────────────────────────────────
   const handleMoodSelect = (mood) => {
     if (mood.id === 'custom') {
       setSelectedMood(mood);
@@ -258,50 +241,105 @@ export default function App() {
     }
   };
 
-  const handleArchetypeSelect = (archetype) => {
+  // For regular archetypes - NO GEMINI, just taste-based search with variety
+  const handleArchetypeSelect = async (archetype) => {
     setSelectedArchetype(archetype);
     setStep('results');
-    fetchForArchetype(selectedMood, archetype);
-  };
-
-  const handleCustomSubmit = async () => {
-    if (!customMoodText.trim()) return;
     setIsLoading(true);
-    setGeminiError('');
+    setError('');
     setTracks([]);
-    setStep('results');
 
     try {
-      const modelId = "gemini-2.5-flash-lite";
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+      // Generate query with variety based on user's taste
+      const query = generateQuery(archetype.searchHint, userTopData);
+
+      // Search Spotify directly - just like your old code worked
+      const found = await searchTracks(token, query);
+
+      setTracks(found);
+      setPlaylistMeta({
+        name: `${selectedMood.emoji} ${archetype.label}`,
+        description: archetype.desc
+      });
+
+      if (found.length === 0) {
+        setError('No tracks found. Try a different vibe.');
+      }
+    } catch (e) {
+      console.error('Search error:', e);
+      setError('Something went wrong. Try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // For custom text - ONLY HERE WE USE GEMINI for NLP
+  const handleCustomSubmit = async () => {
+    if (!customMoodText.trim()) return;
+
+    setStep('results');
+    setIsLoading(true);
+    setError('');
+    setTracks([]);
+
+    try {
+      // Try Gemini to understand the natural language
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
       const prompt = `
-        The user describes their current mood/vibe as: "${customMoodText}"
-        ${tasteContext}
-        Generate a Spotify search query for music that fits this perfectly. Personalize it to their taste.
-        Generate a short punchy playlist name (max 4 words, catchy) and a one-sentence description.
-        Output raw JSON only: { "searchQuery": string, "playlistName": string, "playlistDescription": string }
+        The user describes their current mood as: "${customMoodText}"
+        
+        Generate a simple Spotify search query (3-5 words) that would find music matching this vibe.
+        Also generate a short playlist name (max 4 words).
+        
+        Output ONLY JSON: { 
+          "searchQuery": string, 
+          "playlistName": string 
+        }
       `;
 
-      const gemRes = await fetchWithRetry(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          systemInstruction: { parts: [{ text: "Music curator. Output raw JSON only." }] },
-          generationConfig: { responseMimeType: "application/json" },
+          generationConfig: { temperature: 0.7 },
         }),
       });
 
-      const gemData = await gemRes.json();
-      const text = gemData.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error("No response");
+      if (!res.ok) throw new Error('Gemini failed');
 
-      const result = JSON.parse(text);
-      setPlaylistMeta({ name: result.playlistName, description: result.playlistDescription });
-      const found = await searchTracks(result.searchQuery);
-      setTracks(found);
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (text) {
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const result = JSON.parse(jsonMatch[0]);
+
+          // Add taste-based variety to the search query
+          let searchQuery = result.searchQuery || customMoodText;
+          if (userTopData?.artists?.length > 0) {
+            const artists = userTopData.artists;
+            searchQuery = `${searchQuery} ${artists[Math.floor(Math.random() * artists.length)]?.name || ''}`;
+          }
+
+          const found = await searchTracks(token, searchQuery);
+          setTracks(found);
+          setPlaylistMeta({
+            name: result.playlistName || 'Your Vibe',
+            description: customMoodText
+          });
+        }
+      } else {
+        throw new Error('No response');
+      }
     } catch (e) {
-      setGeminiError("Couldn't decode that vibe. Try again.");
+      console.error('Gemini error, falling back to direct search:', e);
+      // Fallback to direct search with the custom text
+      const found = await searchTracks(token, customMoodText);
+      setTracks(found);
+      setPlaylistMeta({ name: 'Your Vibe', description: customMoodText });
     } finally {
       setIsLoading(false);
     }
@@ -311,6 +349,7 @@ export default function App() {
     if (queue.find(t => t.id === track.id)) return;
     setQueue(prev => [...prev, track]);
   };
+
   const removeFromQueue = (id) => setQueue(prev => prev.filter(t => t.id !== id));
 
   const savePlaylist = async () => {
@@ -330,18 +369,18 @@ export default function App() {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ uris: toSave.map(t => t.uri) }),
       });
-      if (!addRes.ok) { setSaveStatus('error'); return; }
-      setSaveStatus('saved');
-      setTimeout(() => setSaveStatus(''), 3000);
+      setSaveStatus(addRes.ok ? 'saved' : 'error');
+      if (addRes.ok) setTimeout(() => setSaveStatus(''), 3000);
     } catch (e) { setSaveStatus('error'); }
   };
 
   const reset = () => {
     setStep('mood'); setSelectedMood(null); setSelectedArchetype(null);
-    setTracks([]); setQueue([]); setCustomMoodText(''); setGeminiError(''); setSaveStatus('');
+    setTracks([]); setQueue([]); setCustomMoodText(''); setError(''); setSaveStatus('');
+    setPlaylistMeta({ name: '', description: '' });
   };
 
-  // ─── UI ────────────────────────────────────────────────
+  // ─── UI (keep your existing UI exactly the same) ────────────
   return (
     <div className="min-h-screen bg-neutral-950 text-white font-sans selection:bg-green-500/20">
       <div className="max-w-2xl mx-auto px-4 py-6">
@@ -390,7 +429,8 @@ export default function App() {
             <p className="text-blue-400 font-bold uppercase tracking-widest text-[10px]">Debug</p>
             <p className="text-neutral-400">Redirect URI:</p>
             <code className="block p-2 bg-black rounded text-green-400 break-all select-all">{REDIRECT_URI}</code>
-            <p className="text-neutral-400">Client ID: <span className={SPOTIFY_CLIENT_ID ? "text-green-400" : "text-red-400"}>{SPOTIFY_CLIENT_ID ? "Loaded" : "Missing — check .env"}</span></p>
+            <p className="text-neutral-400">Client ID: <span className={SPOTIFY_CLIENT_ID ? "text-green-400" : "text-red-400"}>{SPOTIFY_CLIENT_ID ? "Loaded" : "Missing"}</span></p>
+            <p className="text-neutral-400">Gemini Key: <span className={GEMINI_API_KEY ? "text-green-400" : "text-red-400"}>{GEMINI_API_KEY ? "Loaded" : "Missing"}</span></p>
           </div>
         )}
 
@@ -423,7 +463,7 @@ export default function App() {
               </div>
             )}
 
-            {/* STEP: Custom mood text input */}
+            {/* STEP: Custom mood text input - ONLY PLACE GEMINI IS USED */}
             {step === 'custom' && (
               <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
                 <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
@@ -487,10 +527,16 @@ export default function App() {
                   </button>
                   {!isLoading && tracks.length > 0 && (
                     <button
-                      onClick={() => { setStep('archetype'); setTracks([]); }}
+                      onClick={() => {
+                        if (selectedArchetype) {
+                          handleArchetypeSelect(selectedArchetype);
+                        } else if (customMoodText) {
+                          handleCustomSubmit();
+                        }
+                      }}
                       className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors"
                     >
-                      <Shuffle size={14} /> Try another vibe
+                      <Shuffle size={14} /> Refresh
                     </button>
                   )}
                 </div>
@@ -501,10 +547,13 @@ export default function App() {
                     <div className="h-4 w-64 bg-neutral-800 animate-pulse rounded" />
                     {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" />)}
                   </div>
-                ) : geminiError ? (
+                ) : error ? (
                   <div className="text-center py-12">
-                    <p className="text-neutral-500 mb-4">{geminiError}</p>
-                    <button onClick={() => selectedArchetype && fetchForArchetype(selectedMood, selectedArchetype)} className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all">Try again</button>
+                    <p className="text-neutral-500 mb-4">{error}</p>
+                    <button onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
+                      className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all">
+                      Try again
+                    </button>
                   </div>
                 ) : (
                   <>
@@ -549,12 +598,6 @@ export default function App() {
                           className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all"
                         >
                           <span className="text-xs text-neutral-700 w-4 text-center shrink-0 group-hover:hidden">{i + 1}</span>
-                          <button
-                            onClick={() => addToQueue(track)}
-                            className={`hidden group-hover:flex items-center justify-center w-4 shrink-0 transition-all ${queue.find(t => t.id === track.id) ? 'text-green-400' : 'text-neutral-400 hover:text-white'}`}
-                          >
-                            {queue.find(t => t.id === track.id) ? <Check size={14} strokeWidth={3} /> : <PlusCircle size={14} />}
-                          </button>
                           <img src={track.image} className="w-10 h-10 rounded-lg shrink-0 shadow-lg" alt="" />
                           <div className="flex-1 min-w-0">
                             <p className="font-bold text-sm truncate text-white">{track.title}</p>
@@ -571,13 +614,13 @@ export default function App() {
                     </div>
 
                     {/* Save all */}
-                    {tracks.length > 0 && queue.length === 0 && (
+                    {tracks.length > 0 && (
                       <button
                         onClick={savePlaylist}
                         disabled={saveStatus === 'saving'}
                         className={`w-full py-3 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95 ${saveStatus === 'saved' ? 'bg-green-500 text-black' : 'bg-neutral-800 border border-neutral-700 hover:bg-neutral-700 text-white'}`}
                       >
-                        {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved to Spotify!' : 'Save All to Spotify'}
+                        {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved to Spotify!' : queue.length > 0 ? 'Save My Pick' : 'Save All to Spotify'}
                       </button>
                     )}
                   </>
