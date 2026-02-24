@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Music, LogIn, LogOut, Info, User, Trash2, PlusCircle, Check, Wand2, Search, Sparkles, ChevronLeft, Shuffle, Languages } from 'lucide-react';
+import { Music, LogIn, LogOut, Info, User, Trash2, PlusCircle, Check, Sparkles, ChevronLeft, Shuffle, Languages } from 'lucide-react';
 
 const SPOTIFY_CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID;
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
@@ -97,38 +97,310 @@ const MOODS = [
   { id: 'anxious', emoji: '😰', label: { en: 'Anxious', th: 'เครียด' } },
   { id: 'bored', emoji: '😑', label: { en: 'Bored', th: 'เบื่อ' } },
   { id: 'custom', emoji: '✏️', label: { en: 'Describe it', th: 'บอกหน่อยสิ' } },
+  { id: 'confused', emoji: '❓', label: { en: 'Confused', th: 'ฮะ?' } },
 ];
 
+// ─── Archetype config ─────────────────────────────────────
+// genrePool: arrays of [searchQuery, weight] — real genre names Spotify actually indexes
+//   Format options:
+//     "indie pop"           → plain genre search (most common)
+//     "genre:shoegaze"      → exact genre field match (precise but narrower)
+//   Rule: NEVER use vibe descriptions ("upbeat banger", "feel good dance")
+//         ALWAYS use real genre names a DJ/Spotify editor would use
+//
+// compatibleUserGenres: keywords OK to pull from user's top genres (mood gate)
+// incompatibleKeywords: if user's top genre contains any of these, skip it
 const ARCHETYPES = {
   sad: [
-    { id: 'wallow', label: { en: 'I Loved Her', th: 'คิดถึงใครอ่ะ' }, emoji: '💔', desc: { en: 'Sink into it. Sad songs for sad days.', th: 'ดิ่งเลย' }, searchHint: 'heartbreak melancholy sad ballad emotional' },
-    { id: 'cheer', label: { en: 'Cheer Me Up', th: 'ปลุกใจ' }, emoji: '☀️', desc: { en: 'Pull me out of it. Uplifting and warm.', th: 'เพลงที่ทำให้รู้สึกดีขึ้น' }, searchHint: 'uplifting feel-good happy energetic pop' },
-    { id: 'rage', label: { en: 'RAHHH', th: 'วากกกก!!!!' }, emoji: '🔥', desc: { en: 'Channel it into something fierce.', th: 'เปลี่ยนความเศร้าเป็นพลัง' }, searchHint: 'angry empowerment fierce punk rock breakup anthem' },
-    { id: 'surprise', label: { en: 'Surprise Me', th: 'สุ่ม' }, emoji: '🎲', desc: { en: 'I have no idea what I need. Pick for me.', th: 'ไม่รู้ว่าต้องการอะไร เลือกให้หน่อย' }, searchHint: 'unexpected eclectic genre-blending unique discovery' },
+    {
+      id: 'wallow',
+      label: { en: 'I Loved Her', th: 'คิดถึงใครอ่ะ' },
+      emoji: '💔',
+      desc: { en: 'Sink into it. Sad songs for sad days.', th: 'ดิ่งเลย' },
+      // Real genres: slowcore, emo, sad folk, chamber pop, post-rock (all proven Spotify terms)
+      genrePool: ['slowcore', 'genre:emo', 'sad folk', 'chamber pop', 'indie folk heartbreak', 'shoegaze melancholy', 'bedroom pop sad'],
+      compatibleUserGenres: ['indie', 'folk', 'singer-songwriter', 'alternative', 'emo', 'shoegaze', 'dream pop', 'acoustic', 'post-hardcore', 'atmospheric', 'dark'],
+      incompatibleKeywords: ['dance', 'edm', 'party', 'upbeat', 'hype', 'pop punk'],
+    },
+    {
+      id: 'cheer',
+      label: { en: 'Cheer Me Up', th: 'ปลุกใจ' },
+      emoji: '☀️',
+      desc: { en: 'Pull me out of it. Uplifting and warm.', th: 'เพลงที่ทำให้รู้สึกดีขึ้น' },
+      // Sunshine pop, twee pop, jangle pop — real uplifting genres
+      genrePool: ['sunshine pop', 'twee pop', 'jangle pop', 'indie pop', 'folk pop uplifting', 'soft rock warm'],
+      compatibleUserGenres: ['indie', 'pop', 'folk', 'acoustic', 'singer-songwriter', 'soft rock'],
+      incompatibleKeywords: ['metal', 'hardcore', 'aggressive', 'dark', 'heavy', 'doom'],
+    },
+    {
+      id: 'rage',
+      label: { en: 'RAHHH', th: 'วากกกก!!!!' },
+      emoji: '🔥',
+      desc: { en: 'Channel it into something fierce.', th: 'เปลี่ยนความเศร้าเป็นพลัง' },
+      // Post-hardcore, screamo, skramz — cathartic real genre names
+      genrePool: ['post-hardcore', 'genre:screamo', 'skramz', 'melodic hardcore', 'emo violence', 'grunge'],
+      compatibleUserGenres: ['rock', 'punk', 'emo', 'alternative', 'post-hardcore', 'metal', 'grunge'],
+      incompatibleKeywords: ['dance', 'edm', 'lofi', 'chill', 'ambient'],
+    },
+    {
+      id: 'surprise',
+      label: { en: 'Surprise Me', th: 'สุ่ม' },
+      emoji: '🎲',
+      desc: { en: 'I have no idea what I need. Pick for me.', th: 'ไม่รู้ว่าต้องการอะไร เลือกให้หน่อย' },
+      genrePool: ['neo soul melancholy', 'trip hop', 'dark folk', 'indie r&b', 'art pop melancholy'],
+      compatibleUserGenres: ['indie', 'alternative', 'r&b', 'hip hop', 'folk', 'pop', 'soul'],
+      incompatibleKeywords: ['party', 'dance', 'edm', 'hype'],
+    },
   ],
   happy: [
-    { id: 'ride', label: { en: 'Keep It Going', th: 'ไปต่อกันแปะ' }, emoji: '🚀', desc: { en: 'Match the energy. Let\'s go higher.', th: 'รักษาพลังงานนี้ไว้' }, searchHint: 'euphoric energetic dance pop feel-good banger' },
-    { id: 'contrast', label: { en: 'Calm Me Down', th: 'ผ่อนคลาย' }, emoji: '🌊', desc: { en: 'Balance it out. Chill and smooth.', th: 'ทำใจให้ร่ม' }, searchHint: 'chill lofi ambient mellow smooth downtempo' },
-    { id: 'chaos', label: { en: 'I\'m Unhinged', th: 'สุดเหวี่ยง' }, emoji: '⚡', desc: { en: 'Turn it into something chaotic and loud.', th: 'ปล่อยพลังสุดเหวี่ยง' }, searchHint: 'aggressive metal punk hardcore noise experimental' },
-    { id: 'surprise', label: { en: 'Surprise Me', th: 'จ้ำจี้' }, emoji: '🎲', desc: { en: 'Just vibe me something unexpected.', th: 'มะเขือเปาะแปะ' }, searchHint: 'unexpected genre-blending eclectic discovery' },
+    {
+      id: 'ride',
+      label: { en: 'Keep It Going', th: 'ไปต่อกันแปะ' },
+      emoji: '🚀',
+      desc: { en: "Match the energy. Let's go higher.", th: 'รักษาพลังงานนี้ไว้' },
+      // Nu disco, electropop, dance pop, funk — real energetic genres
+      genrePool: ['nu disco', 'electropop', 'genre:dance-pop', 'funk', 'indie pop dance', 'power pop'],
+      compatibleUserGenres: ['pop', 'dance', 'indie pop', 'electropop', 'funk', 'r&b', 'disco', 'nu metal', 'metal', 'rock', 'electronic', 'core'],
+      incompatibleKeywords: ['sad', 'melancholy', 'doom', 'depressing', 'slowcore', 'funeral'],
+    },
+    {
+      id: 'contrast',
+      label: { en: 'Calm Me Down', th: 'ผ่อนคลาย' },
+      emoji: '🌊',
+      desc: { en: 'Balance it out. Chill and smooth.', th: 'ทำใจให้ร่ม' },
+      // Lo-fi hip hop, chillwave, smooth r&b, ambient pop
+      genrePool: ['genre:lo-fi', 'chillwave', 'smooth r&b', 'genre:ambient', 'downtempo', 'nu jazz'],
+      compatibleUserGenres: ['lofi', 'chill', 'ambient', 'jazz', 'soul', 'r&b', 'indie', 'acoustic'],
+      incompatibleKeywords: ['aggressive', 'metal', 'hardcore', 'loud', 'intense'],
+    },
+    {
+      id: 'chaos',
+      label: { en: "I'm Unhinged", th: 'สุดเหวี่ยง' },
+      emoji: '⚡',
+      desc: { en: 'Turn it into something chaotic and loud.', th: 'ปล่อยพลังสุดเหวี่ยง' },
+      // Hyperpop, noise rock, mathcore, punk — all real genres
+      genrePool: ['genre:hyperpop', 'noise rock', 'mathcore', 'genre:punk', 'no wave', 'power electronics'],
+      compatibleUserGenres: ['punk', 'metal', 'hardcore', 'noise', 'experimental', 'rock', 'hyperpop', 'nu metal', 'core', 'electronic', 'industrial'],
+      incompatibleKeywords: ['chill', 'lofi', 'ambient', 'soft', 'acoustic'],
+    },
+    {
+      id: 'surprise',
+      label: { en: 'Surprise Me', th: 'จ้ำจี้' },
+      emoji: '🎲',
+      desc: { en: 'Just vibe me something unexpected.', th: 'มะเขือเปาะแปะ' },
+      genrePool: ['art pop', 'genre:afrobeats', 'bossa nova', 'city pop', 'neo soul'],
+      compatibleUserGenres: ['indie', 'pop', 'alternative', 'r&b', 'hip hop', 'funk', 'soul', 'metal', 'rock', 'electronic', 'comedy'],
+      incompatibleKeywords: ['funeral', 'doom', 'depressing', 'slowcore'],
+    },
   ],
   angry: [
-    { id: 'fuel', label: { en: 'Feed the Fire', th: 'เติมไฟ' }, emoji: '💢', desc: { en: 'More rage. Louder. Harder.', th: 'เวรย่อมระงับด้วยเวร' }, searchHint: 'metal hardcore punk aggressive heavy brutal' },
-    { id: 'detox', label: { en: 'Cool It Down', th: 'เย็นลง' }, emoji: '🧊', desc: { en: 'Something to slowly bring me back.', th: 'เย็นๆนะ' }, searchHint: 'calming ambient peaceful meditative slow' },
-    { id: 'groove', label: { en: 'Angry but Groovy', th: 'เหวี่ยงแบบมีสไตล์' }, emoji: '😤', desc: { en: 'Angry energy but with a rhythm.', th: 'โมโหแต่มีจังหวะ' }, searchHint: 'hip hop aggressive trap dark funk groove' },
-    { id: 'surprise', label: { en: 'Surprise Me', th: 'สุ่ม' }, emoji: '🎲', desc: { en: 'Anger is just energy. Channel it anywhere.', th: 'เปลี่ยนความโกรธเป็นพลังงาน' }, searchHint: 'unexpected genre-blending unique' },
+    {
+      id: 'fuel',
+      label: { en: 'Feed the Fire', th: 'เติมไฟ' },
+      emoji: '💢',
+      desc: { en: 'More rage. Louder. Harder.', th: 'เวรย่อมระงับด้วยเวร' },
+      // Thrash metal, death metal, grindcore, powerviolence — legit extreme genres
+      genrePool: ['genre:thrash-metal', 'death metal', 'grindcore', 'powerviolence', 'genre:hardcore', 'industrial metal'],
+      compatibleUserGenres: ['metal', 'hardcore', 'core', 'punk', 'death metal', 'thrash', 'rap', 'industrial', 'electronic'],
+      incompatibleKeywords: ['chill', 'lofi', 'soft', 'acoustic', 'ambient'],
+    },
+    {
+      id: 'detox',
+      label: { en: 'Cool It Down', th: 'เย็นลง' },
+      emoji: '🧊',
+      desc: { en: 'Something to slowly bring me back.', th: 'เย็นๆนะ' },
+      genrePool: ['genre:ambient', 'new age', 'genre:acoustic', 'fingerstyle guitar', 'genre:classical', 'piano instrumental'],
+      compatibleUserGenres: ['ambient', 'lofi', 'acoustic', 'classical', 'jazz', 'folk', 'new age'],
+      incompatibleKeywords: ['aggressive', 'metal', 'hardcore', 'loud', 'intense', 'punk'],
+    },
+    {
+      id: 'groove',
+      label: { en: 'Angry but Groovy', th: 'เหวี่ยงแบบมีสไตล์' },
+      emoji: '😤',
+      desc: { en: 'Angry energy but with a rhythm.', th: 'โมโหแต่มีจังหวะ' },
+      // Nu metal, rap rock, dark funk — angry but rhythmic real genres
+      genrePool: ['genre:nu-metal', 'rap rock', 'dark funk', 'genre:trap', 'g-funk', 'drill'],
+      compatibleUserGenres: ['hip hop', 'funk', 'r&b', 'rap', 'trap', 'nu metal', 'rock'],
+      incompatibleKeywords: ['soft', 'acoustic', 'lofi', 'ambient', 'chill', 'classical'],
+    },
+    {
+      id: 'surprise',
+      label: { en: 'Surprise Me', th: 'สุ่ม' },
+      emoji: '🎲',
+      desc: { en: 'Anger is just energy. Channel it anywhere.', th: 'เปลี่ยนความโกรธเป็นพลังงาน' },
+      genrePool: ['post-punk', 'noise pop', 'genre:industrial', 'art punk', 'math rock'],
+      compatibleUserGenres: ['rock', 'rap', 'alternative', 'indie', 'r&b', 'metal', 'punk'],
+      incompatibleKeywords: ['soft pop', 'lofi', 'chill', 'ambient'],
+    },
   ],
   anxious: [
-    { id: 'ground', label: { en: 'Ground Me', th: 'ตั้งสติ' }, emoji: '🌿', desc: { en: 'Slow my brain down. Calm and steady.', th: 'ทำให้สมองช้าลง' }, searchHint: 'ambient calm lofi peaceful meditative acoustic' },
-    { id: 'mask', label: { en: 'Drown It Out', th: 'กลบเกลื่อน' }, emoji: '🎧', desc: { en: 'Something loud enough to stop the thoughts.', th: 'เพลงดังๆ ให้หยุดคิด' }, searchHint: 'loud energetic intense wall of sound focus' },
-    { id: 'relate', label: { en: 'You Get It', th: 'เข้าใจฉัน' }, emoji: '🫂', desc: { en: 'Songs that understand the spiral.', th: 'เพลงที่เข้าใจความรู้สึก' }, searchHint: 'anxiety overthinking introspective indie emotional' },
-    { id: 'surprise', label: { en: 'Distract Me', th: 'ดึงสมาธิ' }, emoji: '🎲', desc: { en: 'Literally anything. Just get me out of my head.', th: 'อะไรก็ได้ที่ทำให้ไม่อยู่ในหัว' }, searchHint: 'fun quirky upbeat distraction playful' },
+    {
+      id: 'ground',
+      label: { en: 'Ground Me', th: 'ตั้งสติ' },
+      emoji: '🌿',
+      desc: { en: 'Slow my brain down. Calm and steady.', th: 'ทำให้สมองช้าลง' },
+      // Drone ambient, new age, fingerstyle, minimalist classical
+      genrePool: ['genre:ambient', 'drone', 'new age', 'fingerstyle guitar', 'genre:lo-fi', 'minimalist classical'],
+      compatibleUserGenres: ['ambient', 'folk', 'acoustic', 'lofi', 'classical', 'jazz', 'new age'],
+      incompatibleKeywords: ['fast', 'intense', 'aggressive', 'loud', 'hardcore'],
+    },
+    {
+      id: 'mask',
+      label: { en: 'Drown It Out', th: 'กลบเกลื่อน' },
+      emoji: '🎧',
+      desc: { en: 'Something loud enough to stop the thoughts.', th: 'เพลงดังๆ ให้หยุดคิด' },
+      // Shoegaze, post-rock, noise pop, dream pop — dense and immersive, real genres
+      genrePool: ['genre:shoegaze', 'post-rock', 'noise pop', 'dream pop', 'blackgaze'],
+      compatibleUserGenres: ['shoegaze', 'dream pop', 'indie rock', 'alternative', 'noise rock', 'post-rock', 'math rock', 'core', 'metal', 'electronic'],
+      incompatibleKeywords: ['acoustic', 'sparse', 'minimal', 'lofi'],
+    },
+    {
+      id: 'relate',
+      label: { en: 'You Get It', th: 'เข้าใจฉัน' },
+      emoji: '🫂',
+      desc: { en: 'Songs that understand the spiral.', th: 'เพลงที่เข้าใจความรู้สึก' },
+      // Indie folk confessional, bedroom pop, emo — songs with introspective lyrics
+      genrePool: ['genre:emo', 'bedroom pop', 'indie folk', 'confessional singer-songwriter', 'lo-fi indie'],
+      compatibleUserGenres: ['indie', 'alternative', 'singer-songwriter', 'emo', 'pop', 'folk'],
+      incompatibleKeywords: ['party', 'dance', 'hype', 'aggressive', 'metal'],
+    },
+    {
+      id: 'surprise',
+      label: { en: 'Distract Me', th: 'ดึงสมาธิ' },
+      emoji: '🎲',
+      desc: { en: 'Literally anything. Just get me out of my head.', th: 'อะไรก็ได้ที่ทำให้ไม่อยู่ในหัว' },
+      genrePool: ['genre:afrobeats', 'bossa nova', 'city pop', 'genre:funk', 'bubblegum pop'],
+      compatibleUserGenres: ['indie', 'pop', 'alternative', 'funk', 'r&b'],
+      incompatibleKeywords: ['dark', 'depressing', 'heavy', 'doom'],
+    },
+  ],
+  confused: [
+    {
+      id: 'what',
+      label: { en: 'what', th: 'อะไรนะ' },
+      emoji: '❓',
+      desc: { en: 'okay.', th: 'โอเค.' },
+      // Genuinely weird Spotify-legible genres — not vibe descriptions
+      genrePool: [
+        // ── the void (genuinely unlistenable to most humans) ──
+        'genre:noise',
+        'power electronics',
+        'harsh noise wall',
+        'musique concrete',
+        'lowercase',
+        'electroacoustic',
+        'acousmatic',
+        'onkyo',
+        'plunderphonics',
+        'zeuhl',
+        'spectralism',
+        'microtonal',
+        'totalism',
+        'drone doom',
+        'outsider music',
+        'deconstructed club',
+        'glitch',
+        'genre:industrial',
+        'japanoise',
+        'merzbow',
+        'clown core',
+        'skramz',
+        'pornogrind',
+        'gorenoise',
+        'brutal slamming deathcore',
+        'genre:grindcore',
+        'freak folk',
+        'dark cabaret',
+        'death industrial',
+        'ritual ambient',
+        'neofolk dark',
+        // ── borderline ──
+        'genre:vaporwave',
+        'genre:hypnagogic-pop',
+        'math jazz',
+        'genre:free-jazz',
+        'genre:avant-garde',
+        'contemporary classical',
+        'genre:jazz-fusion',
+        'breakcore',
+        // ── funny/chaotic/random ──
+        'comedy rap',
+        'genre:novelty',
+        'nerdcore',
+        'wizard rock',          // harry potter fan genre. yes it exists.
+        'bardcore',             // medieval cover songs. also yes.
+        'sea shanty',
+        'cowpunk',
+        'pirate metal',
+        'polka punk',
+        'nintendo core',
+        'bounce',               // new orleans bounce. extremely unserious.
+        'chiptune',
+        'anime rap',
+        'goregrind',            // grindcore but the lyrics are all about food
+        'stoner doom',          // extremely slow metal for extremely high people
+        'bubblegum bass',
+        'nightcore',
+        'speedcore',            // 300+ bpm. legally not music.
+        'extratone',            // 1000+ bpm. physically not music.
+        'happy hardcore',
+        'gabber',               // dutch hardcore that sounds like a jackhammer at a rave
+        'jug band',
+        'comedy country',
+        'parody',
+        'surreal meme music',
+        'turkish psychedelic',  // wildly underrated, wildly unhinged
+        'brostep',
+        'genre:ska',
+        'ska punk',
+        'genre:reggaeton',      // in here purely to confuse
+      ],
+      // No user genre filtering — the whole point is it ignores your taste
+      compatibleUserGenres: [],
+      incompatibleKeywords: [],
+    },
   ],
   bored: [
-    { id: 'discover', label: { en: 'Find Me Something New', th: 'อะไรใหม่ๆหน่อย' }, emoji: '🔭', desc: { en: 'I want to hear something I\'ve never heard.', th: 'อยากฟังอะไรที่ไม่เคยฟัง' }, searchHint: 'underground obscure niche emerging artist discovery' },
-    { id: 'nostalgia', label: { en: 'Take Me Back', th: 'คิดถึงอดีต' }, emoji: '📼', desc: { en: 'Old favorites. Nostalgic hits.', th: 'เพลงเก่าๆ คิดถึง' }, searchHint: 'nostalgic classic throwback 90s 00s retro' },
-    { id: 'intensity', label: { en: 'Wake Me Up', th: 'สะดุ้งแรงๆ' }, emoji: '⚡', desc: { en: 'Something intense to jolt me out of this.', th: 'เพลงที่ทำให้ตื่น' }, searchHint: 'high energy intense fast-paced adrenaline' },
-    { id: 'surprise', label: { en: 'Surprise Me', th: 'สุ่มเลย' }, emoji: '🎲', desc: { en: 'Randomize it completely.', th: 'อะไรก็เอา' }, searchHint: 'eclectic random genre-blending unexpected' },
+    {
+      id: 'discover',
+      label: { en: 'Find Me Something New', th: 'อะไรใหม่ๆหน่อย' },
+      emoji: '🔭',
+      desc: { en: "I want to hear something I've never heard.", th: 'อยากฟังอะไรที่ไม่เคยฟัง' },
+      // Micro-genres and genuinely niche real Spotify terms
+      genrePool: ['genre:hypnagogic-pop', 'vaporwave', 'genre:witch-house', 'outsider house', 'post-punk revival'],
+      compatibleUserGenres: ['indie', 'alternative', 'experimental', 'art rock', 'post-punk', 'avant-garde'],
+      incompatibleKeywords: ['mainstream', 'top 40', 'popular'],
+    },
+    {
+      id: 'nostalgia',
+      label: { en: 'Take Me Back', th: 'คิดถึงอดีต' },
+      emoji: '📼',
+      desc: { en: 'Old favorites. Nostalgic hits.', th: 'เพลงเก่าๆ คิดถึง' },
+      // Decade-specific real Spotify genre tags
+      genrePool: ['genre:new-wave', 'synthpop 80s', 'genre:grunge', 'britpop', 'genre:trip-hop'],
+      compatibleUserGenres: ['classic rock', 'oldies', 'retro', 'soul', 'r&b', 'pop', 'new wave'],
+      incompatibleKeywords: ['emerging', 'underground'],
+    },
+    {
+      id: 'intensity',
+      label: { en: 'Wake Me Up', th: 'สะดุ้งแรงๆ' },
+      emoji: '⚡',
+      desc: { en: 'Something intense to jolt me out of this.', th: 'เพลงที่ทำให้ตื่น' },
+      // Drum and bass, big beat, speed metal, jungle — genuinely high-BPM genres
+      genrePool: ['genre:drum-and-bass', 'big beat', 'speed metal', 'genre:jungle', 'electro house'],
+      compatibleUserGenres: ['rock', 'electronic', 'metal', 'punk', 'hip hop', 'dance', 'edm'],
+      incompatibleKeywords: ['slow', 'chill', 'lofi', 'ambient', 'acoustic', 'mellow'],
+    },
+    {
+      id: 'surprise',
+      label: { en: 'Surprise Me', th: 'สุ่มเลย' },
+      emoji: '🎲',
+      desc: { en: 'Randomize it completely.', th: 'อะไรก็เอา' },
+      // Genuinely eclectic real genres — something from left field
+      genrePool: ['genre:cumbia', 'genre:afrobeat', 'genre:reggaeton', 'chiptune', 'genre:psych-rock'],
+      compatibleUserGenres: ['indie', 'alternative', 'pop', 'hip hop', 'r&b', 'electronic', 'rock', 'folk'],
+      incompatibleKeywords: [],
+    },
   ],
 };
 
@@ -141,40 +413,123 @@ const generateRandomString = (length) => {
 const sha256 = async (plain) => window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(plain));
 const base64encode = (input) => btoa(String.fromCharCode(...new Uint8Array(input))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 
-const searchTracks = async (token, query, retryCount = 0) => {
-  if (!query || query.trim() === '') return [];
+// ─── Core: extract user's top genres from top artists ────────
+// Pulls all unique genres from top 20 artists — Spotify tags these with
+// micro-genres like "vapor soul", "indie poptimism", "escape room" etc.
+const extractUserGenres = (userTopData) => {
+  if (!userTopData) return [];
+  // Prefer Gemma-inferred genres (artist names → genre mapping)
+  // since Spotify's API no longer returns genre data on top artists
+  if (userTopData.inferredGenres?.length) return userTopData.inferredGenres;
+  // Fallback: try native genre field in case it ever comes back
+  return [...new Set((userTopData.artists || []).flatMap(a => a.genres || []))].filter(Boolean);
+};
 
-  // Clean the query
-  const cleanQuery = query
-    .replace(/[^\w\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
+// Fisher-Yates — unbiased unlike sort(() => random)
+const shuffleArray = (arr) => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
 
-  if (!cleanQuery) return [];
+// ─── Core: build personalized pool from user genres + archetype ──
+// Goal: at least half the pool comes from the user's actual taste.
+// The archetype's hardcoded genrePool acts as a backbone/floor —
+// always present so new users (no taste data) still get good results.
+//
+// Compatibility check uses word-level matching so "vapor soul" matches
+// the "soul" compatible keyword, "indie poptimism" matches "indie", etc.
+const buildPersonalizedPool = (archetype, userGenres) => {
+  // Confused/what archetype: no personalization — pure random chaos from the full pool
+  if (archetype.id === 'what') {
+    return shuffleArray(archetype.genrePool);
+  }
 
-  console.log('Searching Spotify with:', cleanQuery);
+  // FIXED archetypes skip personalization entirely — pure chaos, no taste blending
+  if (archetype.FIXED) return shuffleArray([...archetype.genrePool]);
+
+  // Word-level match: "vapor soul" → ["vapor", "soul"], checks against keywords
+  const wordMatch = (genre, keyword) => {
+    const genreWords = genre.toLowerCase().split(/[\s-]+/);
+    const kwWords = keyword.toLowerCase().split(/[\s-]+/);
+    return genreWords.some(gw => kwWords.some(kw => gw.includes(kw) || kw.includes(gw)));
+  };
+
+  // Qualifier words that poison a genre match even if a keyword matches
+  // e.g. "comedy pop" matches keyword "pop" but "comedy" disqualifies it for music moods
+  // Only block genres that are genuinely non-music or would break results
+  // comedy, novelty etc are valid if that's what the user listens to
+  const QUALIFIER_POISON = ['children', 'holiday', 'christmas', 'religious'];
+
+  console.log('--- Genre gate debug ---');
+  console.log('Raw user genres:', userGenres);
+  console.log('Compatible keywords:', archetype.compatibleUserGenres);
+
+  const compatible = userGenres.filter(genre => {
+    const genreLower = genre.toLowerCase();
+
+    // Reject if genre contains a poison qualifier regardless of keyword match
+    if (QUALIFIER_POISON.some(p => genreLower.includes(p))) {
+      console.log('  POISON:', genre);
+      return false;
+    }
+
+    const isCompatible = archetype.compatibleUserGenres.some(compat => wordMatch(genre, compat));
+    const isIncompatible = archetype.incompatibleKeywords.some(bad => wordMatch(genre, bad));
+    if (isCompatible && !isIncompatible) console.log('  PASS:', genre);
+    else console.log('  FAIL:', genre);
+    return isCompatible && !isIncompatible;
+  });
+
+  // Deduplicate user genres against hardcoded pool (avoid near-duplicates)
+  const hardcodedLower = archetype.genrePool.map(g => g.replace('genre:', '').toLowerCase());
+  const uniqueUserGenres = compatible.filter(g =>
+    !hardcodedLower.some(h => h.includes(g.toLowerCase()) || g.toLowerCase().includes(h))
+  );
+
+  // Target: user genres = at least half the pool
+  // e.g. if hardcoded pool has 6 items, we want at least 6 user genres alongside
+  const targetUserCount = Math.max(archetype.genrePool.length, uniqueUserGenres.length);
+  const userSlice = shuffleArray(uniqueUserGenres).slice(0, targetUserCount);
+
+  // Combine: ALL hardcoded (backbone) + as many user genres as available
+  const combined = [...archetype.genrePool, ...userSlice];
+
+  console.log(`Pool for ${archetype.id}: ${combined.length} total (${archetype.genrePool.length} hardcoded + ${userSlice.length} from user taste)`);
+  console.log('User genres available:', uniqueUserGenres.length);
+  console.log('Sample:', combined.slice(0, 6));
+
+  return shuffleArray(combined);
+};
+
+// ─── Core: single Spotify search ─────────────────────────────
+const searchTracks = async (token, query) => {
+  if (!query?.trim()) return [];
+
+  // Preserve Spotify field operators like genre:shoegaze before cleaning
+  const genreMatches = [];
+  const withPlaceholders = query.replace(/genre:([a-z0-9_-]+)/gi, (match, g) => {
+    genreMatches.push(g);
+    return `GENREPLACEHOLDER${genreMatches.length - 1}`;
+  });
+  const cleaned = withPlaceholders.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const clean = cleaned.replace(/GENREPLACEHOLDER(\d+)/g, (_, i) => `genre:${genreMatches[i]}`).slice(0, 80);
+
+  if (!clean) return [];
+  console.log('Spotify search query:', clean);
 
   try {
-    console.log('Attempting Spotify search with query:', cleanQuery);
     const res = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(cleanQuery)}&type=track&limit=10`,
-
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(clean)}&type=track&limit=8&offset=${Math.floor(Math.random() * 40)}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    if (res.status === 401) {
-      handleLogout();
-      return [];
-    }
-
-    if (!res.ok) {
-      console.error('Search failed:', await res.text());
-      return [];
-    }
-
+    if (res.status === 401) { handleLogout(); return []; }
+    if (!res.ok) return [];
     const data = await res.json();
-    console.log('Spotify search results:', data);
-    const tracks = (data.tracks?.items || []).map(t => ({
+    return (data.tracks?.items || []).map(t => ({
       id: t.id,
       title: t.name,
       artist: t.artists.map(a => a.name).join(', '),
@@ -183,116 +538,83 @@ const searchTracks = async (token, query, retryCount = 0) => {
       popularity: t.popularity,
       image: t.album.images?.[1]?.url || t.album.images?.[0]?.url || '',
     }));
-
-    // If no tracks found, try progressively simpler queries
-    if (tracks.length === 0 && retryCount < 3) {
-      const words = cleanQuery.split(' ');
-
-      if (words.length > 2) {
-        // Try with fewer words
-        const simplerQuery = words.slice(0, 2).join(' ');
-        console.log('No results, trying simpler query:', simplerQuery);
-        return searchTracks(token, simplerQuery, retryCount + 1);
-      } else if (words.length === 2) {
-        // Try with just the first word
-        const simplerQuery = words[0];
-        console.log('No results, trying single word:', simplerQuery);
-        return searchTracks(token, simplerQuery, retryCount + 1);
-      } else if (retryCount === 0 && userTopData?.artists?.length > 0) {
-        // Last resort: use a random artist from their top list
-        const randomArtist = userTopData.artists[Math.floor(Math.random() * userTopData.artists.length)]?.name;
-        if (randomArtist) {
-          console.log('Trying random artist:', randomArtist);
-          return searchTracks(token, randomArtist, retryCount + 1);
-        }
-      }
-    }
-
-    return tracks;
   } catch (e) {
     console.error('Search error:', e);
     return [];
   }
 };
 
-// Generate search query with variety based on user's taste - SIMPLIFIED VERSION
-const generateQuery = (baseHint, userTopData) => {
-  if (!userTopData?.artists?.length) return baseHint.split(' ').slice(0, 2).join(' ');
-
-  // Get user's top artists and genres
-  const userArtists = userTopData.artists.map(a => a.name).filter(Boolean);
-  const userGenres = [...new Set(userTopData.artists.flatMap(a => a.genres || []))].filter(Boolean);
-
-  // Base words from the hint (first 2 words)
-  const baseWords = baseHint.split(' ').slice(0, 2).join(' ');
-
-  // Build creative query options - back to the working style
-  const queryOptions = [
-    // Base + artist
-    `${baseWords} ${userArtists[Math.floor(Math.random() * userArtists.length)]}`,
-
-    // Base + genre
-    ...(userGenres.length > 0 ? [`${baseWords} ${userGenres[Math.floor(Math.random() * userGenres.length)]}`] : []),
-
-    // Just the base hint
-    baseWords,
-
-    // Base + discovery terms
-    `${baseWords} underground`,
-    `${baseWords} deep cuts`,
-    `${baseWords} obscure`,
-    `${baseWords} hidden gem`,
-
-    // Mood combinations
-    `chill ${baseWords}`,
-    `dark ${baseWords}`,
-    `upbeat ${baseWords}`,
-    `dreamy ${baseWords}`,
-
-    // Artist similar to
-    `similar to ${userArtists[Math.floor(Math.random() * userArtists.length)]}`,
-
-    // Random cool combos
-    `${userGenres[Math.floor(Math.random() * userGenres.length)]} vibes`,
-    `${baseWords} playlist`,
-  ];
-
-  // Filter out any undefined or empty options
-  const validOptions = queryOptions.filter(q => q && q.length > 0);
-
-  // Pick a random option
-  const selectedQuery = validOptions[Math.floor(Math.random() * validOptions.length)];
-
-  console.log('Generated query:', selectedQuery);
-
-  return selectedQuery
-    .replace(/[^\w\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 40);
+// ─── Core: parallel multi-query search + merge ───────────────
+// Runs 3 searches in parallel, merges results, deduplicates by track ID,
+// then shuffles to give variety across queries
+const multiSearch = async (token, queries) => {
+  const results = await Promise.all(queries.map(q => searchTracks(token, q)));
+  const seen = new Set();
+  const merged = [];
+  // Interleave results so we don't get all tracks from query 1 first
+  const maxLen = Math.max(...results.map(r => r.length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const result of results) {
+      if (result[i] && !seen.has(result[i].id)) {
+        seen.add(result[i].id);
+        merged.push(result[i]);
+      }
+    }
+  }
+  return merged.slice(0, 15);
 };
 
-// Mix familiar and discovery tracks with creative filtering - DEBUG VERSION
-const mixTracks = (tracks, userTopData) => {
-  if (!tracks || tracks.length === 0) return tracks;
+// ─── Core: build search queries from archetype + user genres ──
+// Returns a different random 3 queries every call from the personalized pool
+const buildArchetypeQueries = (archetype, userTopData) => {
+  const userGenres = extractUserGenres(userTopData);
+  const pool = buildPersonalizedPool(archetype, userGenres); // shuffled, user-heavy
+  return pool.slice(0, 3);
+};
 
-  console.log('mixTracks received:', tracks.length, 'tracks');
-  console.log('First track sample:', tracks[0]);
+// ─── Core: Gemma-3 for custom text ───────────────────────────
+const getGemmaQueries = async (customText, userTopData) => {
+  const userGenres = extractUserGenres(userTopData).slice(0, 8);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-  // Safely get user's top artists and tracks
-  const userArtists = userTopData?.artists || [];
-  const userTracks = userTopData?.tracks || [];
+  const prompt = `The user describes their mood: "${customText}"
 
-  // Get user's top artist names for reference
-  const userArtistNames = new Set(userArtists.map(a => a?.name || '').filter(Boolean));
-  const userTrackIds = new Set(userTracks.map(t => t?.id || '').filter(Boolean));
+Their music taste includes these genres: ${userGenres.length ? userGenres.join(', ') : 'unknown'}.
 
-  // Get user's top genres
-  const userGenres = [...new Set(userArtists.flatMap(a => a?.genres || []))].filter(Boolean);
+Generate exactly 3 Spotify search queries to find music matching this vibe.
 
-  // SIMPLIFIED: Just return all tracks shuffled for now to test
-  console.log('Returning all tracks shuffled for testing');
-  return [...tracks].sort(() => Math.random() - 0.5).slice(0, 10);
+CRITICAL RULES:
+- Use ONLY real established music genre names that Spotify indexes (e.g. "shoegaze", "nu disco", "trip hop", "post-hardcore", "bedroom pop", "neo soul", "synthpop", "drill")
+- You may prefix with "genre:" for exact matching (e.g. "genre:shoegaze")
+- NEVER use vibe descriptions like "feel good", "upbeat banger", "emotional depth" — these match song titles not genres
+- NEVER use artist names or song titles
+- Blend 1-2 of the user genres ONLY if they match the emotional tone
+- Also generate a short poetic playlist name (max 4 words)
+- Output ONLY valid JSON, no markdown
+
+Output format: { "queries": ["genre1", "genre2", "genre3"], "playlistName": "name here" }`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.8 },
+    }),
+  });
+
+  if (!res.ok) throw new Error('Gemma failed');
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('No JSON in response');
+  return JSON.parse(jsonMatch[0]);
+};
+
+// ─── Fallback: if multiSearch returns <3 tracks, broaden ─────
+const fallbackSearch = async (token, archetype) => {
+  const broadQuery = archetype.genrePool[0].split(' ').slice(0, 2).join(' ');
+  return searchTracks(token, broadQuery);
 };
 
 export default function App() {
@@ -301,7 +623,7 @@ export default function App() {
   const [userProfile, setUserProfile] = useState(null);
   const [userTopData, setUserTopData] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
-  const [language, setLanguage] = useState('en'); // 'en' or 'th'
+  const [language, setLanguage] = useState('en');
 
   const [step, setStep] = useState('mood');
   const [selectedMood, setSelectedMood] = useState(null);
@@ -314,31 +636,86 @@ export default function App() {
   const [playlistMeta, setPlaylistMeta] = useState({ name: '', description: '' });
   const [saveStatus, setSaveStatus] = useState('');
   const [error, setError] = useState('');
+  const [loadingStatus, setLoadingStatus] = useState('');
 
   const processedCode = useRef(null);
-
+  const genreInferenceRef = useRef(null); // holds the pending Gemma promise
   const t = translations[language];
 
   // ─── Auth ──────────────────────────────────────────────
-  const fetchUserProfile = async (t) => {
-    if (!t) return;
-    const res = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${t}` } });
+  const handleLogout = () => {
+    localStorage.removeItem('token'); localStorage.removeItem('code_verifier');
+    setToken(''); setIsConnected(false); setUserProfile(null); setUserTopData(null);
+    reset();
+  };
+
+  const fetchUserProfile = async (tk) => {
+    if (!tk) return;
+    const res = await fetch('https://api.spotify.com/v1/me', { headers: { Authorization: `Bearer ${tk}` } });
     if (res.ok) setUserProfile(await res.json());
     else if (res.status === 401) handleLogout();
   };
 
-  const fetchUserTopData = async (t) => {
-    if (!t) return;
+  const fetchUserTopData = async (tk) => {
+    if (!tk) return;
     try {
       const [ar, tr] = await Promise.all([
-        fetch('https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
-        fetch('https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${t}` } }),
+        fetch('https://api.spotify.com/v1/me/top/artists?limit=20&time_range=medium_term', { headers: { Authorization: `Bearer ${tk}` } }),
+        fetch('https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${tk}` } }),
       ]);
-      setUserTopData({
-        artists: ar.ok ? (await ar.json()).items : [],
-        tracks: tr.ok ? (await tr.json()).items : [],
-      });
+      const artists = ar.ok ? (await ar.json()).items : [];
+      const tracks = tr.ok ? (await tr.json()).items : [];
+      setUserTopData({ artists, tracks });
+
+      // Spotify stripped genres from top/artists and locked the artists batch endpoint.
+      // Workaround: ask Gemma to infer genres from artist names — runs once on login,
+      // result stored in userTopData.inferredGenres for the pool builder to use.
+      if (artists.length > 0) {
+        const names = artists.map(a => a.name).join(', ');
+        // Store the promise so handleArchetypeSelect can await it if needed
+        genreInferenceRef.current = inferGenresFromArtists(names, tk);
+      }
     } catch (e) { console.error(e); }
+  };
+
+  // Ask Gemma to infer genres from artist names — fires once after login
+  const inferGenresFromArtists = async (artistNames, tk) => {
+    if (!GEMINI_API_KEY) return;
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+      const prompt = `Given these music artists the user listens to: ${artistNames}
+
+Infer what music genres this person enjoys. Return 10-15 specific genre names that Spotify actually uses (e.g. "progressive metal", "math rock", "dream pop", "neo soul", "bedroom pop", "darkwave").
+
+Rules:
+- Use real Spotify genre names only, no made-up descriptors
+- Be specific — "progressive metal" not just "metal"
+- Reflect the actual diversity of the artist list
+- Output ONLY a JSON array of strings, nothing else
+
+Example output: ["progressive metal", "math rock", "art pop"]`;
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.3 },
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const match = text.match(/\[.*\]/s);
+      if (!match) return;
+      const inferredGenres = JSON.parse(match[0]);
+      console.log('Gemma inferred genres:', inferredGenres);
+      setUserTopData(prev => ({ ...prev, inferredGenres }));
+      return inferredGenres; // return so callers can use immediately without waiting for re-render
+    } catch (e) {
+      console.error('Genre inference failed:', e);
+      return [];
+    }
   };
 
   useEffect(() => {
@@ -380,14 +757,188 @@ export default function App() {
     })}`;
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('token'); localStorage.removeItem('code_verifier');
-    setToken(''); setIsConnected(false); setUserProfile(null); setUserTopData(null);
-    reset();
+  const toggleLanguage = () => setLanguage(prev => prev === 'en' ? 'th' : 'en');
+
+  // ─── Loading status text system ──────────────────────────────────────────
+  // Each step has multiple variants — picked randomly each time.
+  // Some variants reference actual artist names from user's top list.
+  const LOAD_TEXTS = {
+    en: {
+      readingTaste: [
+        "reading your music taste...",
+        "snooping through your spotify history...",
+        "judging your music taste (respectfully)...",
+        "okay let's see what you're actually about...",
+        "pulling up your vibe profile...",
+      ],
+      inferringGenres: [
+        "asking AI what your artists mean...",
+        "translating your chaos into genres...",
+        "figuring out the vibe...",
+        "connecting the dots between your artists...",
+        "running your taste through the machine...",
+      ],
+      buildingPool: [
+        "mixing your taste with the mood...",
+        "building your personal sound pool...",
+        "blending genres like a DJ who knows you...",
+        "crafting your search ingredients...",
+        "combining vibes...",
+      ],
+      searching: [
+        "digging through spotify...",
+        "hunting for the right tracks...",
+        "searching the depths of music...",
+        "sifting through millions of songs...",
+        "looking for exactly this feeling...",
+      ],
+      almostDone: [
+        "almost there...",
+        "just about done...",
+        "putting it together...",
+        "finalizing...",
+        "one sec...",
+      ],
+      confused: [
+        "finding the weirdest corners of the internet...",
+        "unearthing things that should not exist...",
+        "consulting the void...",
+        "this may cause permanent damage. loading.",
+        "looking for sounds that haven't been named yet...",
+        "searching: music? debatable.",
+        "digging through the parts of spotify no one talks about...",
+      ],
+    },
+    th: {
+      readingTaste: [
+        "แอบส่องประวัติ spotify แปปนึงนะ อย่าบอกใคร",
+        "โอ้โห ฟังอะไรบ้างเนี่ย ขอดูหน่อย...",
+        "กำลังตัดสินรสนิยม (แบบรักๆ) อยู่นะ",
+        "เดี๋ยวก็รู้ว่าคุณเป็นคนยังไง...",
+        "สแกน vibe... ได้กลิ่นบางอย่างแล้ว",
+        "ขอแอบดูหน่อยนึงได้ไหม ดูแล้ว",
+      ],
+      inferringGenres: [
+        "ให้ AI เนรมิตแนวเพลงจากศิลปินที่คุณฟังอยู่...",
+        "กำลังถอดรหัสความโกลาหลในหัวคุณ...",
+        "AI กำลังคิดหนักอยู่ รอแปป!",
+        "ประมวลผล vibe... ไม่ได้ง่ายอย่างที่คิดนะ",
+        "แปลงศิลปินเป็นแนวเพลง เหมือนแปลภาษามนุษย์ต่างดาว",
+      ],
+      buildingPool: [
+        "กำลังผสมเพลงให้เข้ากับอารมณ์... เหมือนทำสูตรยา",
+        "คัดเลือกแนวเพลงที่ใช่ ไม่ใช่แค่สุ่มมั่วนะ",
+        "ปั้นแต่ง pool เพลงให้เหมาะกับคุณโดยเฉพาะ",
+        "ผสม vibe กำลังดีไม่มากไม่น้อย",
+        "กำลังทำการบ้านให้คุณอยู่ ขอบคุณก็ดีนะ",
+      ],
+      searching: [
+        "หาเข็มในกองเข็ม... แต่ต้องหาให้ได้",
+        "กำลังขุดหาเพลงในมหาสมุทร spotify...",
+        "ค้นหาอยู่ อย่าเพิ่งไปไหน!",
+        "สแกนเพลงนับล้าน เพื่อคุณคนเดียว (อย่าซึ้งมาก)",
+        "กำลังเสิร์ชอยู่ ใจเย็นๆ!",
+        "ตามหาความรู้สึกนี้ให้เจอ ไม่ยอมแพ้",
+      ],
+      almostDone: [
+        "เกือบละ! ใจเย็น!",
+        "รอแปป! เกือบได้แล้ว",
+        "อีกนิดเดียว อย่าปิดหนีไปไหน",
+        "จวนจะเสร็จ... ช้าแต่ชัวร์",
+        "โหลดอยู่นะ ไม่ได้หลับ",
+      ],
+      confused: [
+        "กำลังหาเพลงที่ไม่ควรมีอยู่...",
+        "ปรึกษาความว่างเปล่าอยู่ รอแปป",
+        "ขุดหาส่วนที่แปลกที่สุดของ spotify...",
+        "เตือนแล้วนะ ถ้าหูพัง อย่ามาโทษ",
+        "กำลังค้นหา: เสียง? ไม่แน่ใจ.",
+        "หาเพลงที่ยังไม่มีชื่อเรียก...",
+      ],
+    },
   };
 
-  const toggleLanguage = () => {
-    setLanguage(prev => prev === 'en' ? 'th' : 'en');
+  // Artist callout — reacts to specific artists in user's top list
+  const NOTABLE_ARTISTS = {
+    en: {
+      'Igorrr': ["igorrr? so you can count.", "igorrr detected. you're fine.", "oh you count. interesting."],
+      'Polyphia': ["polyphia... so you're one of those people.", "polyphia? nerd. (compliment)", "polyphia listener spotted. illegal taste."],
+      'STOMACH BOOK': ["stomach book?? who told you about them", "never heard of them. you win.", "okay underground. noted. 👀"],
+      'Miracle Musical': ["MIRACLE MUSICAL NO WAYYYYYYYYYYYYYY", "miracle musical?? hello???", "HAWAII PART II??? IN THIS ECONOMY???"],
+      'Anomalie': ["anomalie. you're automatically cool.", "anomalie? yeah okay. respect."],
+      'Rammstein': ["DU. DU HAST. DU HAST MICH.", "rammstein. german therapy. understood.", "du hast understood the assignment."],
+      'Avenged Sevenfold': ["a7x. drama enjoyer. got it.", "a7x? classic. no notes.", "so you like theatrics. same."],
+      'Slipknot': ["slipknot!! let's go!!", "9 people wasn't enough apparently.", "slipknot? this playlist goes hard."],
+      'Billie Eilish': ["billie eilish. sad pop with dread. same.", "billie fan 🖤 got it.", "pop but make it ominous. respect."],
+      'Bo Burnham': ["bo burnham?? okay you get it.", "comedy that hits too hard. you know.", "bo burnham listener detected. you're going to be okay."],
+      'C418': ["c418. wet hands jumpscare 😭", "c418!! minecraft feelings loading...", "you felt things in a pixelated world. valid."],
+      'Mick Gordon': ["MICK GORDON. RIP AND TEAR.", "doom ost listener. built different.", "mick gordon? this playlist will be unhinged."],
+      'HYBS': ["hybs! thai taste spotted 🇹🇭", "hybs? sawasdee krub/kha 👋"],
+    },
+    th: {
+      'Igorrr': ["igorrr? นับได้นะ เก่ง", "เจอคนฟัง igorrr. ขอก้มหัว.", "igorrr เหรอ. โอเค. เจ๋ง."],
+      'Polyphia': ["polyphia... เป็นพวกนั้นด้วย งั้นหรอ", "polyphia? เนิร์ด (แบบชม)", "polyphia เหรอ. รสนิยมผิดกฎหมาย."],
+      'STOMACH BOOK': ["stomach book?? ใครบอกให้รู้จักเนี่ย", "ไม่รู้จักเลย. คุณชนะ.", "underground เกิน google ยังไม่รู้จัก 👀"],
+      'Miracle Musical': ["MIRACLE MUSICAL อย่าาาาาาาา", "miracle musical?? เฮ้ยยยย???", "HAWAII PART II??? จริงเหรอ???"],
+      'Anomalie': ["anomalie. เท่โดยอัตโนมัติ.", "anomalie เหรอ โอเค นับถือ"],
+      'Rammstein': ["DU. DU HAST. DU HAST MICH.", "rammstein. therapy แบบเยอรมัน. เข้าใจ.", "du hast เข้าใจ assignment แล้ว"],
+      'Avenged Sevenfold': ["a7x. ชอบ drama. ได้เลย.", "a7x? คลาสสิก ไม่มีติ.", "theatrics enjoyer. เหมือนกันเลย."],
+      'Slipknot': ["slipknot!! ไปเลย!!", "9 คนยังไม่พอ งั้นหรอ", "slipknot? playlist นี้โหดแน่"],
+      'Billie Eilish': ["billie eilish. pop + ความหม่น. เหมือนกัน.", "billie fan 🖤 โอเค", "pop แต่น่ากลัวนิดนึง. นับถือ."],
+      'Bo Burnham': ["bo burnham? โอเค คุณเข้าใจ.", "comedy ที่เจ็บเกินไป. รู้ดี.", "bo burnham listener. คุณโอเคนะ?"],
+      'C418': ["c418. wet hands jumpscare 😭", "c418!! กำลังโหลดความรู้สึก minecraft...", "เคยร้องไห้ใน pixelated world. ปกติ."],
+      'Mick Gordon': ["MICK GORDON. RIP AND TEAR เลย.", "doom ost listener. เกิดมาเพื่อสิ่งนี้.", "mick gordon? playlist นี้จะโกลาหล."],
+      'HYBS': ["hybs! เจอคนไทยซะที 🇹🇭", "hybs? สวัสดีจ้า 👋"],
+    },
+  };
+
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+  const GENERIC_CALLOUTS = {
+    en: [
+      (a) => `${a}? good taste.`,
+      (a) => `oh you listen to ${a}? respect.`,
+      (a) => `${a} spotted. nice.`,
+      (a) => `${a}... okay i see you.`,
+      (a) => `${a}? didn't expect that. cool.`,
+      (a) => `so you're a ${a} person. noted.`,
+      (a) => `${a}!! solid choice.`,
+    ],
+    th: [
+      (a) => `${a}? รสนิยมดีนะ`,
+      (a) => `ฟัง ${a} ด้วยเหรอ นับถือ`,
+      (a) => `${a} เจอแล้ว โอเคมาก`,
+      (a) => `${a}... โอ้โห เห็นคุณแล้ว`,
+      (a) => `${a}? ไม่คาดคิดเลย เก๋ดี`,
+      (a) => `คนฟัง ${a} งั้นหรอ จดไว้แล้ว`,
+      (a) => `${a}!! เลือกได้ดีมาก`,
+    ],
+  };
+
+  const getArtistCallout = (lang) => {
+    const artists = userTopData?.artists?.map(a => a.name) || [];
+    if (!artists.length) return null;
+
+    const texts = NOTABLE_ARTISTS[lang];
+    // Collect ALL hardcoded matches first
+    const allMatches = artists
+      .filter(a => texts[a])
+      .map(a => pick(texts[a]));
+
+    if (allMatches.length > 0) {
+      return allMatches[Math.floor(Math.random() * allMatches.length)];
+    }
+
+    // No hardcoded match — pick a random artist and use a generic template
+    const randomArtist = artists[Math.floor(Math.random() * artists.length)];
+    const templates = GENERIC_CALLOUTS[lang];
+    return pick(templates)(randomArtist);
+  };
+
+  const setLoadStep = (key) => {
+    const texts = LOAD_TEXTS[language];
+    const arr = texts[key];
+    setLoadingStatus(pick(arr));
   };
 
   // ─── Main logic ────────────────────────────────────────
@@ -395,13 +946,16 @@ export default function App() {
     if (mood.id === 'custom') {
       setSelectedMood(mood);
       setStep('custom');
+    } else if (mood.id === 'confused') {
+      setSelectedMood(mood);
+      setStep('confused');
     } else {
       setSelectedMood(mood);
       setStep('archetype');
     }
   };
 
-  // For regular archetypes - NO GEMINI, just taste-based search with variety
+  // Pre-defined archetype: build genre-blended queries, run parallel search
   const handleArchetypeSelect = async (archetype) => {
     setSelectedArchetype(archetype);
     setStep('results');
@@ -410,110 +964,161 @@ export default function App() {
     setTracks([]);
 
     try {
-      // Generate query with variety based on user's taste - no genre seeds needed
-      const query = generateQuery(archetype.searchHint, userTopData);
+      const pause = (ms) => new Promise(r => setTimeout(r, ms));
+      const MIN_MSG_TIME = 650;
 
-      // Search Spotify directly
-      let found = await searchTracks(token, query);
+      // ── Confused path: skip all taste/inference logic, pure hardcoded chaos ──
+      if (archetype.id === 'what') {
+        setLoadStep('confused');
+        await pause(MIN_MSG_TIME);
+        setLoadStep('confused'); // pick another random one
+        const queries = buildArchetypeQueries(archetype, null);
+        const searchStart = Date.now();
+        let found = await multiSearch(token, queries);
+        if (found.length < 3) {
+          const fallback = await fallbackSearch(token, archetype);
+          const seen = new Set(found.map(t => t.id));
+          found = [...found, ...fallback.filter(t => !seen.has(t.id))];
+        }
+        const elapsed = Date.now() - searchStart;
+        if (elapsed < MIN_MSG_TIME) await pause(MIN_MSG_TIME - elapsed);
+        setLoadStep('confused');
+        await pause(500);
+        setTracks(found);
+        setPlaylistMeta({ name: language === 'en' ? '❓ what' : '❓ ฮะ?', description: language === 'en' ? 'okay.' : 'โอเค.' });
+        if (found.length === 0) setError(t.noTracksFound);
+        return;
+      }
 
-      // Mix familiar and discovery tracks
-      found = mixTracks(found, userTopData);
+      // ── Normal path ──────────────────────────────────────────────────────────
+      // Step 1: reading taste
+      setLoadStep('readingTaste');
+      await pause(MIN_MSG_TIME);
+
+      // Maybe swap to an artist callout
+      const callout = getArtistCallout(language);
+      if (callout) {
+        setLoadingStatus(callout);
+        await pause(MIN_MSG_TIME + 200);
+      }
+
+      // Step 2: genre inference — only shows if Gemma is still running
+      let effectiveUserTopData = userTopData;
+      if (genreInferenceRef.current && !userTopData?.inferredGenres) {
+        setLoadStep('inferringGenres');
+        const inferredGenres = await genreInferenceRef.current;
+        if (inferredGenres?.length) {
+          effectiveUserTopData = { ...userTopData, inferredGenres };
+        }
+      }
+
+      // Step 3: building pool
+      setLoadStep('buildingPool');
+      const queriesPromise = Promise.resolve(buildArchetypeQueries(archetype, effectiveUserTopData));
+      await pause(MIN_MSG_TIME);
+      const queries = await queriesPromise;
+
+      // Step 4: searching
+      setLoadStep('searching');
+      const searchStart = Date.now();
+      let found = await multiSearch(token, queries);
+
+      if (found.length < 3) {
+        const fallback = await fallbackSearch(token, archetype);
+        const seen = new Set(found.map(t => t.id));
+        found = [...found, ...fallback.filter(t => !seen.has(t.id))];
+      }
+
+      // If search was super fast, pad so "searching" message was readable
+      const searchElapsed = Date.now() - searchStart;
+      if (searchElapsed < MIN_MSG_TIME) await pause(MIN_MSG_TIME - searchElapsed);
+
+      // Step 5: almost done — always show briefly before results pop
+      setLoadStep('almostDone');
+      await pause(500);
 
       setTracks(found);
       setPlaylistMeta({
         name: `${selectedMood?.emoji || ''} ${archetype.label[language]}`,
-        description: archetype.desc[language]
+        description: archetype.desc[language],
       });
 
-      if (found.length === 0) {
-        setError(t.noTracksFound);
-      }
+      if (found.length === 0) setError(t.noTracksFound);
     } catch (e) {
-      console.error('Search error:', e);
+      console.error('Archetype search error:', e);
       setError(t.somethingWrong);
     } finally {
       setIsLoading(false);
+      setLoadingStatus('');
     }
   };
 
-  // For custom text - ONLY HERE WE USE GEMINI for NLP
+  // Custom text: Gemma generates genre queries → same pipeline
   const handleCustomSubmit = async () => {
     if (!customMoodText.trim()) return;
-
     setStep('results');
     setIsLoading(true);
     setError('');
     setTracks([]);
 
     try {
-      // Try Gemini to understand the natural language
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-      const prompt = `
-      The user describes their current mood as: "${customMoodText}"
-      
-      Generate a simple Spotify search query that would find music matching this vibe with extra moody aesthetics.
-      Also generate a short aesthetic playlist name (max 4 words).
-      
-      Output ONLY JSON: { 
-        "searchQuery": string, 
-        "playlistName": string 
+      setLoadStep('readingTaste');
+      const callout = getArtistCallout(language);
+      if (callout) {
+        await new Promise(r => setTimeout(r, 400));
+        setLoadingStatus(callout);
+        await new Promise(r => setTimeout(r, 600));
       }
-    `;
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7 },
-        }),
-      });
+      setLoadStep('inferringGenres');
+      await new Promise(r => setTimeout(r, 200));
 
-      if (!res.ok) throw new Error('Gemini failed');
+      let queries;
+      let playlistName = t.appName;
 
-      const data = await res.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-      if (text) {
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const result = JSON.parse(jsonMatch[0]);
-          console.log('Gemini result:', result);
-
-          // Use the search query directly from Gemini - NO artist appending
-          let searchQuery = result.searchQuery || customMoodText;
-
-          let found = await searchTracks(token, searchQuery);
-          found = mixTracks(found, userTopData);
-
-          setTracks(found);
-          setPlaylistMeta({
-            name: result.playlistName || t.appName,
-            description: customMoodText
-          });
-        }
-      } else {
-        throw new Error('No response');
+      try {
+        const gemmaResult = await getGemmaQueries(customMoodText, userTopData);
+        queries = gemmaResult.queries || [];
+        playlistName = gemmaResult.playlistName || t.appName;
+        console.log('Gemma queries:', queries);
+      } catch (e) {
+        console.error('Gemma failed, falling back to raw text search:', e);
+        // Fallback: split custom text into simple keyword queries
+        queries = [customMoodText.slice(0, 30)];
       }
-    } catch (e) {
-      console.error('Gemini error, falling back to direct search:', e);
-      // Fallback to direct search with the custom text
-      let found = await searchTracks(token, customMoodText);
-      found = mixTracks(found, userTopData);
+
+      setLoadStep('searching');
+      let found = await multiSearch(token, queries);
+
+      // Fallback if too few
+      if (found.length < 3 && queries.length > 0) {
+        const simpleQuery = queries[0].split(' ').slice(0, 2).join(' ');
+        const fallback = await searchTracks(token, simpleQuery);
+        const seen = new Set(found.map(t => t.id));
+        found = [...found, ...fallback.filter(t => !seen.has(t.id))];
+      }
+
       setTracks(found);
-      setPlaylistMeta({ name: t.appName, description: customMoodText });
+      setPlaylistMeta({ name: playlistName, description: customMoodText });
+
+      setLoadStep('almostDone');
+      await new Promise(r => setTimeout(r, 200));
+      if (found.length === 0) setError(t.noTracksFound);
+    } catch (e) {
+      console.error('Custom submit error:', e);
+      setError(t.somethingWrong);
     } finally {
       setIsLoading(false);
+      setLoadingStatus('');
     }
   };
 
   const addToQueue = (track) => {
-    if (queue.find(t => t.id === track.id)) return;
+    if (queue.find(q => q.id === track.id)) return;
     setQueue(prev => [...prev, track]);
   };
 
-  const removeFromQueue = (id) => setQueue(prev => prev.filter(t => t.id !== id));
+  const removeFromQueue = (id) => setQueue(prev => prev.filter(q => q.id !== id));
 
   const savePlaylist = async () => {
     const toSave = queue.length > 0 ? queue : tracks;
@@ -548,7 +1153,7 @@ export default function App() {
       <div className="max-w-2xl mx-auto px-4 py-6">
 
         {/* Header */}
-        <header className="flex items-center justify-between mb-10 pb-5 border-b border-neutral-800">
+        <header className="flex items-center justify-between mb-6 pb-5 border-b border-neutral-800">
           <div className="flex items-center gap-3">
             <div className="bg-green-500 p-2 rounded-xl text-black">
               <Music size={20} />
@@ -588,7 +1193,7 @@ export default function App() {
           </div>
         </header>
 
-        {/* Language Toggle - Moved outside header */}
+        {/* Language Toggle */}
         <div className="flex justify-end mb-4">
           <button
             onClick={toggleLanguage}
@@ -638,7 +1243,7 @@ export default function App() {
               </div>
             )}
 
-            {/* STEP: Custom mood text input - ONLY PLACE GEMINI IS USED */}
+            {/* STEP: Custom mood */}
             {step === 'custom' && (
               <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
                 <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
@@ -662,6 +1267,31 @@ export default function App() {
                 >
                   <Sparkles size={16} /> {t.findMusic}
                 </button>
+              </div>
+            )}
+
+            {/* STEP: Confused — one big "what" button */}
+            {step === 'confused' && (
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                  <ChevronLeft size={16} /> {t.back}
+                </button>
+                <div className="flex flex-col items-center justify-center py-16 gap-6">
+                  <p className="text-neutral-600 text-sm">{language === 'en' ? 'are you sure?' : 'แน่ใจนะ?'}</p>
+                  <button
+                    onClick={() => handleArchetypeSelect(ARCHETYPES.confused[0])}
+                    className="group relative px-12 py-8 rounded-3xl border-2 border-neutral-700 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-500 active:scale-95 transition-all duration-150 select-none cursor-pointer"
+                  >
+                    <span className="text-7xl font-black uppercase italic tracking-tighter text-white group-hover:text-neutral-100 transition-colors block"
+                      style={{ textShadow: '0 0 40px rgba(255,255,255,0.1)' }}>
+                      {language === 'en' ? 'what' : 'ฮะ?'}
+                    </span>
+                    <span className="block text-center text-neutral-600 text-xs mt-2 group-hover:text-neutral-400 transition-colors">
+                      {language === 'en' ? 'press it' : 'กด'}
+                    </span>
+                  </button>
+                  <p className="text-neutral-700 text-xs">{language === 'en' ? 'no refunds' : 'ไม่รับผิดชอบนะ'}</p>
+                </div>
               </div>
             )}
 
@@ -702,13 +1332,7 @@ export default function App() {
                   </button>
                   {!isLoading && tracks.length > 0 && (
                     <button
-                      onClick={() => {
-                        if (selectedArchetype) {
-                          handleArchetypeSelect(selectedArchetype);
-                        } else if (customMoodText) {
-                          handleCustomSubmit();
-                        }
-                      }}
+                      onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
                       className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors"
                     >
                       <Shuffle size={14} /> {t.refresh}
@@ -717,16 +1341,28 @@ export default function App() {
                 </div>
 
                 {isLoading ? (
-                  <div className="space-y-4">
-                    <div className="h-8 w-48 bg-neutral-800 animate-pulse rounded-lg" />
-                    <div className="h-4 w-64 bg-neutral-800 animate-pulse rounded" />
-                    {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" />)}
+                  <div className="space-y-6 py-8">
+                    <div className="flex flex-col items-center gap-4">
+                      <div className="flex gap-1">
+                        {[0, 1, 2].map(i => (
+                          <div key={i} className="w-2 h-2 rounded-full bg-green-500 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                        ))}
+                      </div>
+                      <p className="text-neutral-400 text-sm text-center min-h-[20px] transition-all duration-300">
+                        {loadingStatus}
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" style={{ animationDelay: `${i * 0.05}s` }} />)}
+                    </div>
                   </div>
                 ) : error ? (
                   <div className="text-center py-12">
                     <p className="text-neutral-500 mb-4">{error}</p>
-                    <button onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
-                      className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all">
+                    <button
+                      onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
+                      className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all"
+                    >
                       {t.tryAgain}
                     </button>
                   </div>
@@ -768,10 +1404,7 @@ export default function App() {
                     {/* Track list */}
                     <div className="space-y-1">
                       {tracks.map((track, i) => (
-                        <div
-                          key={track.id}
-                          className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all"
-                        >
+                        <div key={track.id} className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all">
                           <span className="text-xs text-neutral-700 w-4 text-center shrink-0 group-hover:hidden">{i + 1}</span>
                           <img src={track.image} className="w-10 h-10 rounded-lg shrink-0 shadow-lg" alt="" />
                           <div className="flex-1 min-w-0">
@@ -780,9 +1413,9 @@ export default function App() {
                           </div>
                           <button
                             onClick={() => addToQueue(track)}
-                            className={`shrink-0 p-1.5 rounded-full transition-all ${queue.find(t => t.id === track.id) ? 'text-green-400 bg-green-500/10' : 'text-neutral-600 hover:text-white hover:bg-neutral-700'}`}
+                            className={`shrink-0 p-1.5 rounded-full transition-all ${queue.find(q => q.id === track.id) ? 'text-green-400 bg-green-500/10' : 'text-neutral-600 hover:text-white hover:bg-neutral-700'}`}
                           >
-                            {queue.find(t => t.id === track.id) ? <Check size={16} strokeWidth={3} /> : <PlusCircle size={16} />}
+                            {queue.find(q => q.id === track.id) ? <Check size={16} strokeWidth={3} /> : <PlusCircle size={16} />}
                           </button>
                         </div>
                       ))}
