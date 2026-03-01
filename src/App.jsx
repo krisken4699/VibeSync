@@ -19,6 +19,28 @@ const AUTH_ENDPOINT = "https://accounts.spotify.com/authorize";
 const TOKEN_ENDPOINT = "https://accounts.spotify.com/api/token";
 const SCOPES = "playlist-modify-public playlist-modify-private user-read-private user-read-email user-top-read";
 
+// Fetch a guest-level app token from our serverless proxy (no user login needed)
+// Used for search only — no access to any user's account data
+let guestTokenCache = null;
+const getGuestToken = async () => {
+  if (guestTokenCache && guestTokenCache.expires > Date.now()) {
+    return guestTokenCache.token;
+  }
+  try {
+    const res = await fetch('/api/spotify-token');
+    if (!res.ok) return null;
+    const data = await res.json();
+    guestTokenCache = {
+      token: data.access_token,
+      expires: Date.now() + (data.expires_in - 120) * 1000, // 2min buffer
+    };
+    return guestTokenCache.token;
+  } catch (e) {
+    console.error('Guest token fetch failed:', e);
+    return null;
+  }
+};
+
 // ─── Language translations ─────────────────────────────────
 const translations = {
   en: {
@@ -508,6 +530,9 @@ const buildPersonalizedPool = (archetype, userGenres) => {
 // ─── Core: single Spotify search ─────────────────────────────
 const searchTracks = async (token, query) => {
   if (!query?.trim()) return [];
+  // If no user token, fall back to guest app-level token for search
+  const activeToken = token || await getGuestToken();
+  if (!activeToken) return [];
 
   // Preserve Spotify field operators like genre:shoegaze before cleaning
   const genreMatches = [];
@@ -523,10 +548,10 @@ const searchTracks = async (token, query) => {
 
   try {
     const res = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(clean)}&type=track&limit=8&offset=${Math.floor(Math.random() * 40)}`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(clean)}&type=track&limit=10&offset=${Math.floor(Math.random() * 5) * 10}`,
+      { headers: { Authorization: `Bearer ${activeToken}` } }
     );
-    if (res.status === 401) { handleLogout(); return []; }
+    if (res.status === 401) { if (token) handleLogout(); guestTokenCache = null; return []; }
     if (!res.ok) return [];
     const data = await res.json();
     return (data.tracks?.items || []).map(t => ({
@@ -551,8 +576,7 @@ const multiSearch = async (token, queries) => {
   const results = await Promise.all(queries.map(q => searchTracks(token, q)));
   const seen = new Set();
   const merged = [];
-  // Interleave results so we don't get all tracks from query 1 first
-  const maxLen = Math.max(...results.map(r => r.length));
+  const maxLen = Math.max(0, ...results.map(r => r.length));
   for (let i = 0; i < maxLen; i++) {
     for (const result of results) {
       if (result[i] && !seen.has(result[i].id)) {
@@ -561,15 +585,49 @@ const multiSearch = async (token, queries) => {
       }
     }
   }
-  return merged.slice(0, 15);
+  return merged.slice(0, 20);
 };
 
 // ─── Core: build search queries from archetype + user genres ──
-// Returns a different random 3 queries every call from the personalized pool
+// 5 parallel queries: ~3 from user taste + ~2 from hardcoded pool (3/5 user ratio)
 const buildArchetypeQueries = (archetype, userTopData) => {
+  if (archetype.id === 'what') return shuffleArray(archetype.genrePool).slice(0, 5);
+
   const userGenres = extractUserGenres(userTopData);
-  const pool = buildPersonalizedPool(archetype, userGenres); // shuffled, user-heavy
-  return pool.slice(0, 3);
+
+  const wordMatch = (g, k) => {
+    const gw = g.toLowerCase().split(/[\s-]+/);
+    const kw = k.toLowerCase().split(/[\s-]+/);
+    return gw.some(a => kw.some(b => a.includes(b) || b.includes(a)));
+  };
+
+  // Score each user genre by how many compatible keywords it matches
+  // e.g. "progressive metal" matching both "metal" + "core" scores 2, beats "alt metal" at 1
+  const scored = userGenres
+    .map(genre => {
+      const bad = archetype.incompatibleKeywords.some(b => wordMatch(genre, b));
+      if (bad) return null;
+      const score = archetype.compatibleUserGenres.filter(c => wordMatch(genre, c)).length;
+      if (score === 0) return null;
+      return { genre, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score); // highest match count first
+
+  // Add small random jitter so equally-scored genres shuffle each refresh
+  const jittered = scored.map(s => ({ ...s, score: s.score + Math.random() * 0.5 }))
+    .sort((a, b) => b.score - a.score);
+
+  // Take top 3 most compatible user genres
+  const userPicks = jittered.slice(0, 3).map(s => s.genre);
+  const hardcodedPool = shuffleArray(archetype.genrePool);
+  const hardcodedPicks = hardcodedPool.filter(g => !userPicks.includes(g)).slice(0, 5 - userPicks.length);
+  const queries = [...userPicks, ...hardcodedPicks];
+
+  console.log(`Queries [scored]: ${userPicks.length} user + ${hardcodedPicks.length} hardcoded`);
+  console.log('User picks (most compatible first):', userPicks);
+  console.log('Hardcoded picks:', hardcodedPicks);
+  return queries;
 };
 
 // ─── Core: Gemma-3 for custom text ───────────────────────────
@@ -613,8 +671,18 @@ Output format: { "queries": ["genre1", "genre2", "genre3"], "playlistName": "nam
 
 // ─── Fallback: if multiSearch returns <3 tracks, broaden ─────
 const fallbackSearch = async (token, archetype) => {
-  const broadQuery = archetype.genrePool[0].split(' ').slice(0, 2).join(' ');
-  return searchTracks(token, broadQuery);
+  // Try 3 different broad queries from the pool to maximize chance of results
+  const pool = shuffleArray([...archetype.genrePool]);
+  const broadQueries = pool.slice(0, 3).map(q =>
+    q.replace('genre:', '').split(' ').slice(0, 2).join(' ')
+  );
+  const results = await Promise.all(broadQueries.map(q => searchTracks(token, q)));
+  const seen = new Set();
+  return results.flat().filter(t => {
+    if (seen.has(t.id)) return false;
+    seen.add(t.id);
+    return true;
+  });
 };
 
 export default function App() {
@@ -659,20 +727,35 @@ export default function App() {
   const fetchUserTopData = async (tk) => {
     if (!tk) return;
     try {
-      const [ar, tr] = await Promise.all([
-        fetch('https://api.spotify.com/v1/me/top/artists?limit=20&time_range=medium_term', { headers: { Authorization: `Bearer ${tk}` } }),
-        fetch('https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=medium_term', { headers: { Authorization: `Bearer ${tk}` } }),
+      // Fetch all 3 time ranges in parallel — short=4wks, medium=6mo, long=years
+      // This way a jazz phase from 2 years ago still informs the genre pool,
+      // not just whatever metal you've been on this month
+      const ranges = ['short_term', 'medium_term', 'long_term'];
+      const fetches = ranges.flatMap(range => [
+        fetch(`https://api.spotify.com/v1/me/top/artists?limit=20&time_range=${range}`, { headers: { Authorization: `Bearer ${tk}` } }),
+        fetch(`https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=${range}`, { headers: { Authorization: `Bearer ${tk}` } }),
       ]);
-      const artists = ar.ok ? (await ar.json()).items : [];
-      const tracks = tr.ok ? (await tr.json()).items : [];
+      const responses = await Promise.all(fetches);
+      const [arS, trS, arM, trM, arL, trL] = await Promise.all(responses.map(r => r.ok ? r.json() : { items: [] }));
+
+      // Merge artists across all ranges, deduplicate by id
+      // Weight: short_term artists appear first (most recent taste leads)
+      const allArtists = [...(arS.items || []), ...(arM.items || []), ...(arL.items || [])];
+      const seenIds = new Set();
+      const artists = allArtists.filter(a => {
+        if (seenIds.has(a.id)) return false;
+        seenIds.add(a.id);
+        return true;
+      });
+
+      const tracks = [...(trS.items || []), ...(trM.items || []), ...(trL.items || [])];
+
       setUserTopData({ artists, tracks });
 
-      // Spotify stripped genres from top/artists and locked the artists batch endpoint.
-      // Workaround: ask Gemma to infer genres from artist names — runs once on login,
-      // result stored in userTopData.inferredGenres for the pool builder to use.
       if (artists.length > 0) {
+        // Pass all unique artist names — across all time ranges gives Gemma
+        // a much wider picture of taste breadth, not just recent obsessions
         const names = artists.map(a => a.name).join(', ');
-        // Store the promise so handleArchetypeSelect can await it if needed
         genreInferenceRef.current = inferGenresFromArtists(names, tk);
       }
     } catch (e) { console.error(e); }
@@ -683,17 +766,18 @@ export default function App() {
     if (!GEMINI_API_KEY) return;
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-      const prompt = `Given these music artists the user listens to: ${artistNames}
+      const prompt = `Given these music artists the user listens to across their entire Spotify history: ${artistNames}
 
-Infer what music genres this person enjoys. Return 10-15 specific genre names that Spotify actually uses (e.g. "progressive metal", "math rock", "dream pop", "neo soul", "bedroom pop", "darkwave").
+Infer what music genres this person enjoys. Return 15-25 specific genre names that Spotify actually uses.
 
 Rules:
-- Use real Spotify genre names only, no made-up descriptors
+- Use real Spotify genre names only (e.g. "progressive metal", "math rock", "dream pop", "neo soul", "bedroom pop", "darkwave", "jazz fusion", "lo-fi hip hop")
 - Be specific — "progressive metal" not just "metal"
-- Reflect the actual diversity of the artist list
+- REFLECT THE FULL BREADTH of the artist list — if they listen to both metal AND jazz AND ambient, include all of them
+- Do NOT just focus on the dominant genre — surface the variety
 - Output ONLY a JSON array of strings, nothing else
 
-Example output: ["progressive metal", "math rock", "art pop"]`;
+Example output: ["progressive metal", "math rock", "art pop", "lo-fi hip hop", "dark ambient", "jazz fusion"]`;
 
       const res = await fetch(url, {
         method: 'POST',
@@ -1183,7 +1267,9 @@ Example output: ["progressive metal", "math rock", "art pop"]`;
                 <div className="flex items-center gap-2 bg-neutral-800 p-1 pr-3 rounded-full border border-neutral-700">
                   {userProfile?.images?.[0]?.url
                     ? <img src={userProfile.images[0].url} className="w-7 h-7 rounded-full object-cover" alt="" />
-                    : <div className="w-7 h-7 rounded-full bg-neutral-700 flex items-center justify-center"><User size={12} /></div>
+                    : <div className="w-7 h-7 rounded-full bg-neutral-700 flex items-center justify-center text-xs font-bold text-white">
+                      {userProfile?.display_name?.[0]?.toUpperCase() || '?'}
+                    </div>
                   }
                   <span className="text-xs font-bold hidden sm:inline truncate max-w-[100px]">{userProfile?.display_name}</span>
                 </div>
@@ -1214,170 +1300,172 @@ Example output: ["progressive metal", "math rock", "art pop"]`;
           </div>
         )}
 
-        {!isConnected ? (
-          <div className="text-center py-24 flex flex-col items-center">
-            <Music size={64} className="text-neutral-800 mb-6 animate-pulse" />
-            <h2 className="text-5xl font-black uppercase italic mb-3">{t.appName}.</h2>
-            <p className="text-neutral-500 max-w-sm text-base leading-relaxed">{t.tagline}</p>
-          </div>
-        ) : (
-          <div className="space-y-8">
+        <div className="space-y-8">
 
-            {/* STEP: Mood selection */}
-            {step === 'mood' && (
-              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
-                <h2 className="text-2xl font-black mb-1">{t.howFeeling}</h2>
-                <p className="text-neutral-500 text-sm mb-6">{t.pickMood}</p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                  {MOODS.map(mood => (
-                    <button
-                      key={mood.id}
-                      onClick={() => handleMoodSelect(mood)}
-                      className="flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-700 transition-all active:scale-95 group"
-                    >
-                      <span className="text-3xl">{mood.emoji}</span>
-                      <span className="font-bold text-sm text-neutral-300 group-hover:text-white transition-colors">{mood.label[language]}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* STEP: Custom mood */}
-            {step === 'custom' && (
-              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
-                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
-                  <ChevronLeft size={16} /> {t.back}
-                </button>
-                <h2 className="text-2xl font-black mb-1">{t.describeIt}</h2>
-                <p className="text-neutral-500 text-sm mb-6">{t.pickMood}</p>
-                <div className="bg-neutral-900 border border-neutral-700 rounded-2xl p-4 focus-within:border-purple-500/50 transition-all">
-                  <textarea
-                    value={customMoodText}
-                    onChange={e => setCustomMoodText(e.target.value)}
-                    placeholder={t.describePlaceholder}
-                    className="w-full bg-transparent text-white placeholder:text-neutral-600 resize-none focus:outline-none text-sm leading-relaxed min-h-[80px]"
-                    onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleCustomSubmit())}
-                  />
-                </div>
-                <button
-                  onClick={handleCustomSubmit}
-                  disabled={!customMoodText.trim()}
-                  className="mt-3 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 text-white py-3.5 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95"
-                >
-                  <Sparkles size={16} /> {t.findMusic}
-                </button>
-              </div>
-            )}
-
-            {/* STEP: Confused — one big "what" button */}
-            {step === 'confused' && (
-              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
-                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
-                  <ChevronLeft size={16} /> {t.back}
-                </button>
-                <div className="flex flex-col items-center justify-center py-16 gap-6">
-                  <p className="text-neutral-600 text-sm">{language === 'en' ? 'are you sure?' : 'แน่ใจนะ?'}</p>
+          {/* STEP: Mood selection */}
+          {step === 'mood' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <h2 className="text-2xl font-black mb-1">{t.howFeeling}</h2>
+              <p className="text-neutral-500 text-sm mb-4">{t.pickMood}</p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                {MOODS.map(mood => (
                   <button
-                    onClick={() => handleArchetypeSelect(ARCHETYPES.confused[0])}
-                    className="group relative px-12 py-8 rounded-3xl border-2 border-neutral-700 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-500 active:scale-95 transition-all duration-150 select-none cursor-pointer"
+                    key={mood.id}
+                    onClick={() => handleMoodSelect(mood)}
+                    className="flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-700 transition-all active:scale-95 group"
                   >
-                    <span className="text-7xl font-black uppercase italic tracking-tighter text-white group-hover:text-neutral-100 transition-colors block"
-                      style={{ textShadow: '0 0 40px rgba(255,255,255,0.1)' }}>
-                      {language === 'en' ? 'what' : 'ฮะ?'}
-                    </span>
-                    <span className="block text-center text-neutral-600 text-xs mt-2 group-hover:text-neutral-400 transition-colors">
-                      {language === 'en' ? 'press it' : 'กด'}
-                    </span>
+                    <span className="text-3xl">{mood.emoji}</span>
+                    <span className="font-bold text-sm text-neutral-300 group-hover:text-white transition-colors">{mood.label[language]}</span>
                   </button>
-                  <p className="text-neutral-700 text-xs">{language === 'en' ? 'no refunds' : 'ไม่รับผิดชอบนะ'}</p>
-                </div>
+                ))}
               </div>
-            )}
+              {!isConnected && (
+                <p className="mt-5 text-[11px] text-neutral-600 leading-relaxed text-center">
+                  {language === 'en'
+                    ? <>can't log in or save to spotify? you might not be authorized yet. don't worry — you can host your own copy and add your friends. <a href="https://github.com/YOUR_GITHUB/vibesync" target="_blank" rel="noopener noreferrer" className="text-neutral-500 underline underline-offset-2 hover:text-neutral-300 transition-colors">here's how →</a></>
+                    : <>ล็อกอินไม่ได้หรือบันทึกไม่ได้? อาจยังไม่ได้รับสิทธิ์ ไม่เป็นไร — สามารถโฮสต์เองและเพิ่มเพื่อนได้เลย <a href="https://github.com/YOUR_GITHUB/vibesync" target="_blank" rel="noopener noreferrer" className="text-neutral-500 underline underline-offset-2 hover:text-neutral-300 transition-colors">ดูวิธีตรงนี้ →</a></>
+                  }
+                </p>
+              )}
+            </div>
+          )}
 
-            {/* STEP: Archetype selection */}
-            {step === 'archetype' && selectedMood && (
-              <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
-                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
-                  <ChevronLeft size={16} /> {t.back}
+          {/* STEP: Custom mood */}
+          {step === 'custom' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                <ChevronLeft size={16} /> {t.back}
+              </button>
+              <h2 className="text-2xl font-black mb-1">{t.describeIt}</h2>
+              <p className="text-neutral-500 text-sm mb-6">{t.pickMood}</p>
+              <div className="bg-neutral-900 border border-neutral-700 rounded-2xl p-4 focus-within:border-purple-500/50 transition-all">
+                <textarea
+                  value={customMoodText}
+                  onChange={e => setCustomMoodText(e.target.value)}
+                  placeholder={t.describePlaceholder}
+                  className="w-full bg-transparent text-white placeholder:text-neutral-600 resize-none focus:outline-none text-sm leading-relaxed min-h-[80px]"
+                  onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleCustomSubmit())}
+                />
+              </div>
+              <button
+                onClick={handleCustomSubmit}
+                disabled={!customMoodText.trim()}
+                className="mt-3 w-full flex items-center justify-center gap-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 text-white py-3.5 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95"
+              >
+                <Sparkles size={16} /> {t.findMusic}
+              </button>
+            </div>
+          )}
+
+          {/* STEP: Confused — one big "what" button */}
+          {step === 'confused' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                <ChevronLeft size={16} /> {t.back}
+              </button>
+              <div className="flex flex-col items-center justify-center py-16 gap-6">
+                <p className="text-neutral-600 text-sm">{language === 'en' ? 'are you sure?' : 'แน่ใจนะ?'}</p>
+                <button
+                  onClick={() => handleArchetypeSelect(ARCHETYPES.confused[0])}
+                  className="group relative px-12 py-8 rounded-3xl border-2 border-neutral-700 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-500 active:scale-95 transition-all duration-150 select-none cursor-pointer"
+                >
+                  <span className="text-7xl font-black uppercase italic tracking-tighter text-white group-hover:text-neutral-100 transition-colors block"
+                    style={{ textShadow: '0 0 40px rgba(255,255,255,0.1)' }}>
+                    {language === 'en' ? 'what' : 'ฮะ?'}
+                  </span>
+                  <span className="block text-center text-neutral-600 text-xs mt-2 group-hover:text-neutral-400 transition-colors">
+                    {language === 'en' ? 'press it' : 'กด'}
+                  </span>
                 </button>
-                <h2 className="text-2xl font-black mb-1">
-                  {selectedMood.emoji} {selectedMood.label[language]}
-                </h2>
-                <p className="text-neutral-500 text-sm mb-6">{t.whatListener}</p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {(ARCHETYPES[selectedMood.id] || []).map(archetype => (
-                    <button
-                      key={archetype.id}
-                      onClick={() => handleArchetypeSelect(archetype)}
-                      className="flex items-start gap-4 p-5 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-600 transition-all active:scale-95 text-left group"
-                    >
-                      <span className="text-2xl mt-0.5">{archetype.emoji}</span>
-                      <div>
-                        <p className="font-black text-white text-base leading-tight">{archetype.label[language]}</p>
-                        <p className="text-neutral-500 text-xs mt-1 group-hover:text-neutral-400 transition-colors">{archetype.desc[language]}</p>
-                      </div>
-                    </button>
-                  ))}
-                </div>
+                <p className="text-neutral-700 text-xs">{language === 'en' ? 'no refunds' : 'ไม่รับผิดชอบนะ'}</p>
               </div>
-            )}
+            </div>
+          )}
 
-            {/* STEP: Results */}
-            {step === 'results' && (
-              <div className="animate-in fade-in duration-300 space-y-6">
-                <div className="flex items-center justify-between">
-                  <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors">
-                    <ChevronLeft size={16} /> {t.startOver}
-                  </button>
-                  {!isLoading && tracks.length > 0 && (
-                    <button
-                      onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
-                      className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors"
-                    >
-                      <Shuffle size={14} /> {t.refresh}
-                    </button>
-                  )}
-                </div>
-
-                {isLoading ? (
-                  <div className="space-y-6 py-8">
-                    <div className="flex flex-col items-center gap-4">
-                      <div className="flex gap-1">
-                        {[0, 1, 2].map(i => (
-                          <div key={i} className="w-2 h-2 rounded-full bg-green-500 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
-                        ))}
-                      </div>
-                      <p className="text-neutral-400 text-sm text-center min-h-[20px] transition-all duration-300">
-                        {loadingStatus}
-                      </p>
-                    </div>
-                    <div className="space-y-2">
-                      {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" style={{ animationDelay: `${i * 0.05}s` }} />)}
-                    </div>
-                  </div>
-                ) : error ? (
-                  <div className="text-center py-12">
-                    <p className="text-neutral-500 mb-4">{error}</p>
-                    <button
-                      onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
-                      className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all"
-                    >
-                      {t.tryAgain}
-                    </button>
-                  </div>
-                ) : (
-                  <>
+          {/* STEP: Archetype selection */}
+          {step === 'archetype' && selectedMood && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm mb-6 transition-colors">
+                <ChevronLeft size={16} /> {t.back}
+              </button>
+              <h2 className="text-2xl font-black mb-1">
+                {selectedMood.emoji} {selectedMood.label[language]}
+              </h2>
+              <p className="text-neutral-500 text-sm mb-6">{t.whatListener}</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {(ARCHETYPES[selectedMood.id] || []).map(archetype => (
+                  <button
+                    key={archetype.id}
+                    onClick={() => handleArchetypeSelect(archetype)}
+                    className="flex items-start gap-4 p-5 rounded-2xl border border-neutral-800 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-600 transition-all active:scale-95 text-left group"
+                  >
+                    <span className="text-2xl mt-0.5">{archetype.emoji}</span>
                     <div>
-                      <h2 className="text-3xl font-black leading-tight">{playlistMeta.name}</h2>
-                      <p className="text-neutral-500 text-sm mt-1">{playlistMeta.description}</p>
+                      <p className="font-black text-white text-base leading-tight">{archetype.label[language]}</p>
+                      <p className="text-neutral-500 text-xs mt-1 group-hover:text-neutral-400 transition-colors">{archetype.desc[language]}</p>
                     </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
-                    {/* Queue */}
-                    {queue.length > 0 && (
-                      <div className="bg-green-500/5 border border-green-500/20 rounded-2xl p-4 space-y-2">
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-xs font-black text-green-400 uppercase tracking-widest">{t.myPick} ({queue.length})</span>
+          {/* STEP: Results */}
+          {step === 'results' && (
+            <div className="animate-in fade-in duration-300 space-y-6">
+              <div className="flex items-center justify-between">
+                <button onClick={reset} className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors">
+                  <ChevronLeft size={16} /> {t.startOver}
+                </button>
+                {!isLoading && tracks.length > 0 && (
+                  <button
+                    onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
+                    className="flex items-center gap-1 text-neutral-500 hover:text-white text-sm transition-colors"
+                  >
+                    <Shuffle size={14} /> {t.refresh}
+                  </button>
+                )}
+              </div>
+
+              {isLoading ? (
+                <div className="space-y-6 py-8">
+                  <div className="flex flex-col items-center gap-4">
+                    <div className="flex gap-1">
+                      {[0, 1, 2].map(i => (
+                        <div key={i} className="w-2 h-2 rounded-full bg-green-500 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                      ))}
+                    </div>
+                    <p className="text-neutral-400 text-sm text-center min-h-[20px] transition-all duration-300">
+                      {loadingStatus}
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    {[1, 2, 3, 4, 5].map(i => <div key={i} className="h-16 bg-neutral-900 animate-pulse rounded-2xl" style={{ animationDelay: `${i * 0.05}s` }} />)}
+                  </div>
+                </div>
+              ) : error ? (
+                <div className="text-center py-12">
+                  <p className="text-neutral-500 mb-4">{error}</p>
+                  <button
+                    onClick={() => selectedArchetype ? handleArchetypeSelect(selectedArchetype) : handleCustomSubmit()}
+                    className="bg-neutral-800 hover:bg-neutral-700 px-6 py-2.5 rounded-full text-sm font-bold transition-all"
+                  >
+                    {t.tryAgain}
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <h2 className="text-3xl font-black leading-tight">{playlistMeta.name}</h2>
+                    <p className="text-neutral-500 text-sm mt-1">{playlistMeta.description}</p>
+                  </div>
+
+                  {/* Queue */}
+                  {queue.length > 0 && (
+                    <div className="bg-green-500/5 border border-green-500/20 rounded-2xl p-4 space-y-2">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-black text-green-400 uppercase tracking-widest">{t.myPick} ({queue.length})</span>
+                        {isConnected && (
                           <button
                             onClick={savePlaylist}
                             disabled={saveStatus === 'saving'}
@@ -1385,59 +1473,68 @@ Example output: ["progressive metal", "math rock", "art pop"]`;
                           >
                             {saveStatus === 'saving' ? t.saving : saveStatus === 'saved' ? t.saved : t.saveToSpotify}
                           </button>
-                        </div>
-                        {queue.map(track => (
-                          <div key={track.id} className="flex items-center justify-between gap-3">
-                            <div className="flex items-center gap-3 min-w-0">
-                              <img src={track.image} className="w-8 h-8 rounded-lg shrink-0" alt="" />
-                              <div className="min-w-0">
-                                <p className="text-sm font-bold truncate">{track.title}</p>
-                                <p className="text-xs text-neutral-500 truncate">{track.artist}</p>
-                              </div>
-                            </div>
-                            <button onClick={() => removeFromQueue(track.id)} className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"><Trash2 size={15} /></button>
-                          </div>
-                        ))}
+                        )}
                       </div>
-                    )}
-
-                    {/* Track list */}
-                    <div className="space-y-1">
-                      {tracks.map((track, i) => (
-                        <div key={track.id} className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all">
-                          <span className="text-xs text-neutral-700 w-4 text-center shrink-0 group-hover:hidden">{i + 1}</span>
-                          <img src={track.image} className="w-10 h-10 rounded-lg shrink-0 shadow-lg" alt="" />
-                          <div className="flex-1 min-w-0">
-                            <p className="font-bold text-sm truncate text-white">{track.title}</p>
-                            <p className="text-xs text-neutral-500 truncate">{track.artist} · {track.album}</p>
+                      {queue.map(track => (
+                        <div key={track.id} className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <img src={track.image} className="w-8 h-8 rounded-lg shrink-0" alt="" />
+                            <div className="min-w-0">
+                              <p className="text-sm font-bold truncate">{track.title}</p>
+                              <p className="text-xs text-neutral-500 truncate">{track.artist}</p>
+                            </div>
                           </div>
-                          <button
-                            onClick={() => addToQueue(track)}
-                            className={`shrink-0 p-1.5 rounded-full transition-all ${queue.find(q => q.id === track.id) ? 'text-green-400 bg-green-500/10' : 'text-neutral-600 hover:text-white hover:bg-neutral-700'}`}
-                          >
-                            {queue.find(q => q.id === track.id) ? <Check size={16} strokeWidth={3} /> : <PlusCircle size={16} />}
-                          </button>
+                          <button onClick={() => removeFromQueue(track.id)} className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"><Trash2 size={15} /></button>
                         </div>
                       ))}
                     </div>
+                  )}
 
-                    {/* Save all */}
-                    {tracks.length > 0 && (
-                      <button
-                        onClick={savePlaylist}
-                        disabled={saveStatus === 'saving'}
-                        className={`w-full py-3 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95 ${saveStatus === 'saved' ? 'bg-green-500 text-black' : 'bg-neutral-800 border border-neutral-700 hover:bg-neutral-700 text-white'}`}
-                      >
-                        {saveStatus === 'saving' ? t.saving : saveStatus === 'saved' ? t.savedToSpotify : queue.length > 0 ? t.saveMyPick : t.saveAll}
-                      </button>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
+                  {/* Track list */}
+                  <div className="space-y-1">
+                    {tracks.map((track, i) => (
+                      <div key={track.id} className="group flex items-center gap-4 p-3 rounded-xl hover:bg-neutral-900 transition-all">
+                        <span className="text-xs text-neutral-700 w-4 text-center shrink-0 group-hover:hidden">{i + 1}</span>
+                        <img src={track.image} className="w-10 h-10 rounded-lg shrink-0 shadow-lg" alt="" />
+                        <div className="flex-1 min-w-0">
+                          <p className="font-bold text-sm truncate text-white">{track.title}</p>
+                          <p className="text-xs text-neutral-500 truncate">{track.artist} · {track.album}</p>
+                        </div>
+                        <button
+                          onClick={() => addToQueue(track)}
+                          className={`shrink-0 p-1.5 rounded-full transition-all ${queue.find(q => q.id === track.id) ? 'text-green-400 bg-green-500/10' : 'text-neutral-600 hover:text-white hover:bg-neutral-700'}`}
+                        >
+                          {queue.find(q => q.id === track.id) ? <Check size={16} strokeWidth={3} /> : <PlusCircle size={16} />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
 
-          </div>
-        )}
+                  {/* Save all — only if logged in */}
+                  {tracks.length > 0 && isConnected && (
+                    <button
+                      onClick={savePlaylist}
+                      disabled={saveStatus === 'saving'}
+                      className={`w-full py-3 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95 ${saveStatus === 'saved' ? 'bg-green-500 text-black' : 'bg-neutral-800 border border-neutral-700 hover:bg-neutral-700 text-white'}`}
+                    >
+                      {saveStatus === 'saving' ? t.saving : saveStatus === 'saved' ? t.savedToSpotify : queue.length > 0 ? t.saveMyPick : t.saveAll}
+                    </button>
+                  )}
+                  {/* Connect nudge in results for unauthed users */}
+                  {tracks.length > 0 && !isConnected && (
+                    <button
+                      onClick={handleConnect}
+                      className="w-full py-3 rounded-2xl font-black text-sm uppercase tracking-tight transition-all active:scale-95 bg-neutral-900 border border-neutral-800 hover:bg-neutral-800 text-neutral-500 hover:text-white"
+                    >
+                      {language === 'en' ? '+ Connect Spotify to save & personalize' : '+ เชื่อมต่อ Spotify เพื่อบันทึกและปรับแต่ง'}
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+        </div>
       </div>
     </div>
   );
